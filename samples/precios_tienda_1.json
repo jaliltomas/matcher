@@ -1,0 +1,35 @@
+[
+  {
+    "nombre": "Ariel detergente liquido original 3 litros",
+    "url_producto": "https://tienda1.example/ariel-3l",
+    "img": "https://images.unsplash.com/photo-1583947581924-a6d6f4f7f4ee?q=80&w=800",
+    "precioFinal": 7490.0,
+    "precioLista": 8990.0,
+    "sitio": "Tienda 1",
+    "seller": "RetailUno",
+    "textoffer": "17% OFF",
+    "cantidad": 1
+  },
+  {
+    "nombre": "Detergente para ropa en polvo 3kg",
+    "url_producto": "https://tienda1.example/detergente-polvo-3kg",
+    "img": "https://images.unsplash.com/photo-1615485290382-441e4d049cb5?q=80&w=800",
+    "precioFinal": 6990.0,
+    "precioLista": 7990.0,
+    "sitio": "Tienda 1",
+    "seller": "RetailUno",
+    "textoffer": "12% OFF",
+    "cantidad": 1
+  },
+  {
+    "nombre": "Yerba mate suave seleccion 1kg",
+    "url_producto": "https://tienda1.example/yerba-suave-1kg",
+    "img": "https://images.unsplash.com/photo-1523362628745-0c100150b504?q=80&w=800",
+    "precioFinal": 4690.0,
+    "precioLista": 5290.0,
+    "sitio": "Tienda 1",
+    "seller": "RetailUno",
+    "textoffer": "11% OFF",
+    "cantidad": 1
+  }
+]

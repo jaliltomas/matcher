@@ -1,0 +1,35 @@
+[
+  {
+    "nombre": "Ariel concentrado liquido 3L",
+    "url_producto": "https://tienda2.example/ariel-concentrado-3l",
+    "img": "https://images.unsplash.com/photo-1583947581924-a6d6f4f7f4ee?q=80&w=800",
+    "precioFinal": 7399.0,
+    "precioLista": 8700.0,
+    "sitio": "Tienda 2",
+    "seller": "MercadoDos",
+    "textoffer": "combo ahorro",
+    "cantidad": 1
+  },
+  {
+    "nombre": "Yerba mate organica 1kg",
+    "url_producto": "https://tienda2.example/yerba-organica-1kg",
+    "img": "https://images.unsplash.com/photo-1509042239860-f550ce710b93?q=80&w=800",
+    "precioFinal": 5890.0,
+    "precioLista": 6390.0,
+    "sitio": "Tienda 2",
+    "seller": "MercadoDos",
+    "textoffer": "producto premium",
+    "cantidad": 1
+  },
+  {
+    "nombre": "Yerba mate suave molienda tradicional 1kg",
+    "url_producto": "https://tienda2.example/yerba-suave-tradicional-1kg",
+    "img": "https://images.unsplash.com/photo-1523362628745-0c100150b504?q=80&w=800",
+    "precioFinal": 4790.0,
+    "precioLista": 5450.0,
+    "sitio": "Tienda 2",
+    "seller": "MercadoDos",
+    "textoffer": "precio online",
+    "cantidad": 1
+  }
+]
