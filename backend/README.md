@@ -4,7 +4,7 @@ API para matching de productos con pipeline modular:
 
 1. BLIP-2 embeddings multimodales (texto + imagen)
 2. Almacenamiento y busqueda vectorial en Milvus
-3. Enriquecimiento NER con Qwen-7B
+3. Enriquecimiento NER con Qwen-7B (solo brand/category + evidence)
 4. Reranking cross-encoder con XLM-RoBERTa-large
 5. Validacion final con Qwen-7B
 
@@ -44,6 +44,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 - `GET /prompt-presets`
   - devuelve presets guardados para extraccion y validacion.
+- `POST /prompts/generate`
+  - genera prompts de extraccion y validacion por rubro/cliente usando vLLM.
 - `POST /upload`
   - multipart form-data:
     - `anchor_file`: archivo JSON ancla
@@ -60,7 +62,9 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
     "validator_batch_size": 8,
     "use_resume": true,
     "extraction_prompt_id": "retail_general_v1",
-    "validation_prompt_id": "strict_identity_v1"
+    "validation_prompt_id": "default_validator_auditor_v2",
+    "th_accept": 0.80,
+    "th_reject": 0.35
   }
   ```
 

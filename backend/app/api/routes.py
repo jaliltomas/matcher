@@ -8,6 +8,8 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.schemas import (
     AnchorItem,
+    PromptGenerateRequest,
+    PromptGenerateResponse,
     MatchRequest,
     MatchResponse,
     ProductItem,
@@ -17,7 +19,7 @@ from app.api.schemas import (
 from app.services.data_store import session_store
 from app.services.milvus_client import MilvusVectorStore
 from app.services.pipeline import MatchingPipeline
-from app.services.prompt_library import list_prompt_presets, resolve_prompt
+from app.services.prompt_library import generate_client_prompts, list_prompt_presets, resolve_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,15 @@ def health_check() -> dict[str, str]:
 @router.get("/prompt-presets", response_model=PromptPresetResponse)
 def prompt_presets() -> PromptPresetResponse:
     return PromptPresetResponse.model_validate(list_prompt_presets())
+
+
+@router.post("/prompts/generate", response_model=PromptGenerateResponse)
+def generate_prompts(request: PromptGenerateRequest) -> PromptGenerateResponse:
+    try:
+        generated = generate_client_prompts(request.model_dump())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return PromptGenerateResponse.model_validate(generated)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -118,6 +129,8 @@ async def run_match(request: MatchRequest) -> MatchResponse:
             validation_prompt,
             extraction_prompt_id,
             validation_prompt_id,
+            request.th_accept,
+            request.th_reject,
         )
     except MilvusException as exc:
         raise HTTPException(
