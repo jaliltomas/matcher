@@ -29,9 +29,9 @@ class RerankerStage(ABC):
 
 class ValidatorStage(ABC):
     @abstractmethod
-    def validate_pairs(
+    def validate_groups(
         self,
-        pairs: list[dict[str, Any]],
+        groups: list[dict[str, Any]],
         batch_size: int,
         prompt_template: str | None = None,
     ) -> list[dict[str, Any]]:

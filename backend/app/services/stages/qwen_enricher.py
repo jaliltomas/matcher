@@ -7,6 +7,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from app.services.vllm_client import VllmChatClient
 from app.services.stages.json_parsing import extract_first_json_object, normalize_attributes
 from app.services.stages.base import EnricherStage
 
@@ -25,16 +26,42 @@ class QwenNerEnricherStage(EnricherStage):
         device: str,
         dtype: str,
         max_new_tokens: int,
+        use_vllm: bool,
+        vllm_base_url: str,
+        vllm_api_key: str,
+        vllm_timeout_seconds: int,
+        vllm_max_retries: int,
+        vllm_disable_thinking: bool,
+        vllm_max_parallel: int,
         offload_between_stages: bool = True,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.dtype = dtype
         self.max_new_tokens = max_new_tokens
+        self.use_vllm = use_vllm
         self.offload_between_stages = offload_between_stages
 
         self.tokenizer: Any = None
         self.model: Any = None
+        self.vllm_client: VllmChatClient | None = None
+        if self.use_vllm:
+            self.vllm_client = VllmChatClient(
+                base_url=vllm_base_url,
+                model_id=model_id,
+                api_key=vllm_api_key,
+                timeout_seconds=vllm_timeout_seconds,
+                max_retries=vllm_max_retries,
+                disable_thinking=vllm_disable_thinking,
+                max_parallel=vllm_max_parallel,
+            )
+
+    def _switch_to_local_fallback(self) -> None:
+        if not self.use_vllm:
+            return
+        logger.warning("Qwen NER: fallback de vLLM a transformers local")
+        self.use_vllm = False
+        self.vllm_client = None
 
     def _torch_dtype(self) -> torch.dtype:
         if self.device.startswith("cuda") and self.dtype == "float16":
@@ -42,6 +69,8 @@ class QwenNerEnricherStage(EnricherStage):
         return torch.float32
 
     def _load(self) -> None:
+        if self.use_vllm:
+            return
         if self.model is not None and self.tokenizer is not None:
             return
 
@@ -60,6 +89,8 @@ class QwenNerEnricherStage(EnricherStage):
         self.model.eval()
 
     def _unload(self) -> None:
+        if self.use_vllm:
+            return
         if not self.offload_between_stages:
             return
 
@@ -115,6 +146,30 @@ class QwenNerEnricherStage(EnricherStage):
             return normalize_attributes({}, raw_fallback=output_text)
         return normalize_attributes(parsed, raw_fallback=output_text)
 
+    def _extract_with_vllm(
+        self,
+        items: list[dict[str, Any]],
+        batch_size: int,
+        prompt_template: str | None,
+    ) -> dict[str, dict[str, Any]]:
+        assert self.vllm_client is not None
+        result: dict[str, dict[str, Any]] = {}
+        total_batches = math.ceil(len(items) / batch_size)
+        for batch in tqdm(_chunks(items, batch_size), total=total_batches, desc="Qwen NER(vLLM)", leave=False):
+            prompts = [self._prompt(item.get("nombre", ""), prompt_template) for item in batch]
+            try:
+                outputs = self.vllm_client.complete_many(
+                    prompts,
+                    max_tokens=min(self.max_new_tokens, 96),
+                    workers=min(batch_size, 8),
+                )
+            except Exception as exc:
+                logger.warning("Qwen NER(vLLM) fallo: %s", exc)
+                raise
+            for item, output in zip(batch, outputs):
+                result[item["_id"]] = self._parse_json(output)
+        return result
+
     # Etapa 4 del pipeline: enriquecimiento semantico con Qwen-7B para NER.
     def extract_attributes(
         self,
@@ -124,6 +179,12 @@ class QwenNerEnricherStage(EnricherStage):
     ) -> dict[str, dict[str, Any]]:
         if not items:
             return {}
+
+        if self.use_vllm:
+            try:
+                return self._extract_with_vllm(items, batch_size, prompt_template)
+            except Exception:
+                self._switch_to_local_fallback()
 
         self._load()
         assert self.model is not None

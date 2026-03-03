@@ -24,6 +24,21 @@ cd backend
 docker compose -f docker-compose.milvus.yml up -d
 ```
 
+## Imagen unica Docker (build y run en un comando)
+
+Build + run local (sirve frontend + backend en el mismo contenedor):
+
+```bash
+docker build -t turbomatcher:latest . && docker run --gpus all -p 8000:8000 -v "$PWD/backend/data:/app/backend/data" turbomatcher:latest
+```
+
+Luego abre `http://localhost:8000`.
+
+Notas:
+
+- La imagen esta en `Dockerfile` en la raiz y builda frontend + backend.
+- Si no tienes GPU, quita `--gpus all` y ajusta `DEVICE=cpu` por env si hace falta.
+
 ## Scripts PowerShell (recomendado en Windows)
 
 - Instalacion completa (backend + frontend):

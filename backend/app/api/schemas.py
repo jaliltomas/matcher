@@ -35,6 +35,7 @@ class MatchRequest(BaseModel):
     ner_batch_size: int | None = Field(default=None, ge=1, le=128)
     validator_batch_size: int | None = Field(default=None, ge=1, le=128)
     use_resume: bool = True
+    use_fast_rules: bool = True
     extraction_prompt_id: str | None = None
     validation_prompt_id: str | None = None
     extraction_prompt_text: str | None = None
@@ -50,6 +51,9 @@ class MatchCandidate(BaseModel):
     score_reranker: float
     score_validacion: float
     revisar: bool
+    razon_validacion: str | None = None
+    cantidad_match: int | None = None
+    decision_validacion: str | None = None
     atributos: dict[str, Any]
     sitio: str | None = None
     seller: str | None = None
@@ -74,6 +78,7 @@ class MatchResponse(BaseModel):
     top_n: int
     top_k: int
     use_resume: bool
+    use_fast_rules: bool | None = None
     extraction_prompt_id: str
     validation_prompt_id: str
     results: list[AnchorMatches]

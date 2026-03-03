@@ -3,6 +3,7 @@ import logging
 from functools import lru_cache
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pymilvus.exceptions import MilvusException
 from starlette.concurrency import run_in_threadpool
 
 from app.api.schemas import (
@@ -102,18 +103,28 @@ async def run_match(request: MatchRequest) -> MatchResponse:
     )
 
     pipeline = get_pipeline()
-    response = await run_in_threadpool(
-        pipeline.process,
-        session_data,
-        request.top_n,
-        request.top_k,
-        request.batch_size,
-        request.ner_batch_size,
-        request.validator_batch_size,
-        request.use_resume,
-        extraction_prompt,
-        validation_prompt,
-        extraction_prompt_id,
-        validation_prompt_id,
-    )
+    try:
+        response = await run_in_threadpool(
+            pipeline.process,
+            session_data,
+            request.top_n,
+            request.top_k,
+            request.batch_size,
+            request.ner_batch_size,
+            request.validator_batch_size,
+            request.use_resume,
+            request.use_fast_rules,
+            extraction_prompt,
+            validation_prompt,
+            extraction_prompt_id,
+            validation_prompt_id,
+        )
+    except MilvusException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Milvus no disponible. Si estas resumiendo, activa use_resume y usa una session_id con cache de vector_search; "
+                "si no, levanta Milvus en 127.0.0.1:19530."
+            ),
+        ) from exc
     return MatchResponse.model_validate(response)

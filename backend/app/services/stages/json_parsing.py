@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any
 
 
@@ -54,7 +55,22 @@ def normalize_attributes(payload: dict[str, Any], raw_fallback: str | None = Non
         text = str(value).strip()
         if not text:
             return None
+        lowered = text.lower()
+        if lowered in {"null", "none", "n/a", "na", "-", "s/d", "sin dato"}:
+            return None
         return text[:max_len]
+
+    def _extract_unit(text: str | None) -> str | None:
+        if not text:
+            return None
+        match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(ml|cc|l|lt|lts)", text.lower())
+        if not match:
+            return None
+        value = match.group(1).replace(",", ".")
+        unit = match.group(2)
+        if unit in {"l", "lt", "lts"}:
+            return f"{value} l"
+        return f"{value} ml"
 
     raw_attrs = payload.get("atributos", [])
     attributes: list[str] = []
@@ -62,7 +78,8 @@ def normalize_attributes(payload: dict[str, Any], raw_fallback: str | None = Non
         for item in raw_attrs:
             if isinstance(item, str):
                 clean = item.strip()
-                if clean:
+                lowered = clean.lower()
+                if clean and "null" not in lowered and ": null" not in lowered and "none" not in lowered:
                     attributes.append(clean[:80])
             elif isinstance(item, dict):
                 for key, value in item.items():
@@ -79,9 +96,24 @@ def normalize_attributes(payload: dict[str, Any], raw_fallback: str | None = Non
         "unidad": _clean_scalar(payload.get("unidad"), 40),
     }
 
+    if compact["unidad"] is None:
+        # intenta inferir unidad desde atributos o nombre crudo
+        for attr in compact["atributos"]:
+            inferred = _extract_unit(attr)
+            if inferred:
+                compact["unidad"] = inferred
+                break
+
+    raw_candidate = payload.get("raw")
+    if compact["marca"] is None and isinstance(raw_candidate, str):
+        brand_match = re.search(r'"marca"\s*:\s*"([^"]+)"', raw_candidate, re.IGNORECASE)
+        if brand_match:
+            compact["marca"] = _clean_scalar(brand_match.group(1), 80)
+    if compact["unidad"] is None and isinstance(raw_candidate, str):
+        compact["unidad"] = _extract_unit(raw_candidate)
+
     # Recupera cache vieja o salidas contaminadas tipo "{...}Human: ..."
     # intentando reparsear el primer JSON embebido en raw.
-    raw_candidate = payload.get("raw")
     if isinstance(raw_candidate, str):
         has_core = any([compact["marca"], compact["modelo"], compact["categoria"], compact["atributos"], compact["unidad"]])
         if not has_core:

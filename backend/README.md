@@ -71,3 +71,17 @@ Optimizaciones adicionales:
 - Validator usa reglas rapidas para casos obvios y llama al LLM solo en casos ambiguos.
 - Parsing JSON robusto en NER/validator para evitar respuestas en 0 por salida malformada.
 - Tokenizacion tipo chat y `padding_side=left` para Qwen.
+- Cache global incremental de embeddings de productos por clave `sitio+seller+url_producto`.
+
+Salida de validator (modo batch por ancla):
+
+```json
+{
+  "matches_validos": [
+    {"id": 1, "razon": "coincide marca y volumen", "cantidad": 6}
+  ],
+  "rechazados": [
+    {"id": 2, "razon": "volumen distinto"}
+  ]
+}
+```

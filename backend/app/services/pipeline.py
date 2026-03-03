@@ -12,6 +12,7 @@ import torch
 
 from app.core.config import get_settings
 from app.services.milvus_client import MilvusVectorStore
+from app.services.product_embedding_cache import ProductEmbeddingCache, product_cache_key
 from app.services.stages.base import EmbeddingStage, EnricherStage, RerankerStage, ValidatorStage
 from app.services.stages.blip2_embedder import Blip2EmbeddingStage
 from app.services.stages.qwen_enricher import QwenNerEnricherStage
@@ -50,10 +51,17 @@ class MatchingPipeline:
             image_timeout_seconds=self.settings.image_timeout_seconds,
         )
         self.enricher = enricher or QwenNerEnricherStage(
-            model_id=self.settings.qwen_ner_model_id,
+            model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
             max_new_tokens=self.settings.max_new_tokens,
+            use_vllm=self.settings.use_vllm,
+            vllm_base_url=self.settings.vllm_base_url,
+            vllm_api_key=self.settings.vllm_api_key,
+            vllm_timeout_seconds=self.settings.vllm_timeout_seconds,
+            vllm_max_retries=self.settings.vllm_max_retries,
+            vllm_disable_thinking=self.settings.vllm_disable_thinking,
+            vllm_max_parallel=self.settings.vllm_max_parallel,
             offload_between_stages=self.settings.offload_between_stages,
         )
         self.reranker = reranker or XlmrRerankerStage(
@@ -63,14 +71,64 @@ class MatchingPipeline:
             offload_between_stages=self.settings.offload_between_stages,
         )
         self.validator = validator or QwenValidatorStage(
-            model_id=self.settings.qwen_validator_model_id,
+            model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
             max_new_tokens=self.settings.max_new_tokens,
+            use_vllm=self.settings.use_vllm,
+            vllm_base_url=self.settings.vllm_base_url,
+            vllm_api_key=self.settings.vllm_api_key,
+            vllm_timeout_seconds=self.settings.vllm_timeout_seconds,
+            vllm_max_retries=self.settings.vllm_max_retries,
+            vllm_disable_thinking=self.settings.vllm_disable_thinking,
+            vllm_max_parallel=self.settings.vllm_max_parallel,
             offload_between_stages=self.settings.offload_between_stages,
         )
         self._cache_dir = self.settings.data_dir / "checkpoints"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
+        self._global_embedding_cache = ProductEmbeddingCache(self.settings.data_dir / "global_product_embeddings.sqlite3")
+
+    def _embedding_model_sig(self) -> str:
+        raw = {
+            "model": self.settings.blip2_model_id,
+            "dtype": self.settings.dtype,
+            "device": self.settings.device,
+            "version": "global_v1",
+        }
+        return hashlib.sha1(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+    def _embed_products_with_global_cache(
+        self,
+        products: list[dict[str, Any]],
+        batch_size: int,
+    ) -> tuple[np.ndarray, dict[str, int]]:
+        if not products:
+            return np.zeros((0, 768), dtype=np.float32), {"hits": 0, "misses": 0}
+
+        model_sig = self._embedding_model_sig()
+        keys = [product_cache_key(item) for item in products]
+        unique_keys = list(dict.fromkeys(keys))
+        cached = self._global_embedding_cache.get_many(model_sig, unique_keys)
+
+        miss_key_to_item: dict[str, dict[str, Any]] = {}
+        for key, item in zip(keys, products):
+            if key not in cached and key not in miss_key_to_item:
+                miss_key_to_item[key] = item
+
+        misses = list(miss_key_to_item.items())
+        if misses:
+            miss_items = [item for _, item in misses]
+            miss_embeddings = self.embedder.embed_records(miss_items, batch_size)
+            to_cache = {
+                key: miss_embeddings[idx]
+                for idx, (key, _) in enumerate(misses)
+            }
+            self._global_embedding_cache.put_many(model_sig, to_cache)
+            cached.update(to_cache)
+
+        ordered = np.stack([cached[key] for key in keys], axis=0).astype(np.float32)
+        stats = {"hits": len(keys) - len(misses), "misses": len(misses)}
+        return ordered, stats
 
     def _compact_attrs(self, value: Any) -> dict[str, Any]:
         if isinstance(value, dict):
@@ -99,6 +157,38 @@ class MatchingPipeline:
             "unidad": clean.get("unidad"),
             "atributos": (clean.get("atributos") or [])[:5],
         }
+
+    def _local_vector_search(
+        self,
+        anchor_embeddings: np.ndarray,
+        product_embeddings: np.ndarray,
+        products: list[dict[str, Any]],
+        top_n: int,
+    ) -> list[list[dict[str, Any]]]:
+        logger.warning("[Pipeline] Milvus no disponible, usando busqueda vectorial local (numpy)")
+        if len(products) == 0:
+            return [[] for _ in range(len(anchor_embeddings))]
+
+        k = max(1, min(top_n, len(products)))
+        sims = np.matmul(anchor_embeddings.astype(np.float32), product_embeddings.astype(np.float32).T)
+        results: list[list[dict[str, Any]]] = []
+
+        for row in sims:
+            idxs = np.argpartition(-row, k - 1)[:k]
+            idxs = idxs[np.argsort(-row[idxs])]
+            parsed_row: list[dict[str, Any]] = []
+            for idx in idxs.tolist():
+                product = products[idx]
+                parsed_row.append(
+                    {
+                        "item_idx": int(idx),
+                        "item_id": product["_id"],
+                        "name": product.get("nombre", ""),
+                        "similarity": float(row[idx]),
+                    }
+                )
+            results.append(parsed_row)
+        return results
 
     def _fast_validator_decision(
         self,
@@ -244,9 +334,48 @@ class MatchingPipeline:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _load_latest_stage_json_cache(self, session_id: str, stage: str) -> Any | None:
+        session_dir = self._session_cache_dir(session_id)
+        candidates = sorted(
+            session_dir.glob(f"{stage}_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return None
+
     def _save_json_cache(self, session_id: str, stage: str, key: str, payload: Any) -> None:
         path = self._cache_path(session_id, stage, key, "json")
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _normalize_search_cache(
+        self,
+        payload: Any,
+        expected_queries: int,
+        top_n: int,
+    ) -> list[list[dict[str, Any]]] | None:
+        if not isinstance(payload, list) or len(payload) != expected_queries:
+            return None
+
+        normalized: list[list[dict[str, Any]]] = []
+        for row in payload:
+            if not isinstance(row, list):
+                return None
+            clean_row: list[dict[str, Any]] = []
+            for item in row:
+                if not isinstance(item, dict):
+                    continue
+                if "item_id" not in item or "similarity" not in item:
+                    continue
+                clean_row.append(item)
+            if len(clean_row) < top_n:
+                return None
+            normalized.append(clean_row[:top_n])
+        return normalized
 
     def _load_npy_cache(self, session_id: str, stage: str, key: str) -> np.ndarray | None:
         path = self._cache_path(session_id, stage, key, "npy")
@@ -296,6 +425,7 @@ class MatchingPipeline:
         ner_batch_size: int | None = None,
         validator_batch_size: int | None = None,
         use_resume: bool = True,
+        use_fast_rules: bool = True,
         extraction_prompt: str | None = None,
         validation_prompt: str | None = None,
         extraction_prompt_id: str = "default",
@@ -311,6 +441,55 @@ class MatchingPipeline:
 
         anchors, products = self._prepare_session_items(session_data)
         product_by_id = {item["_id"]: item for item in products}
+
+        search_key = self._cache_key(
+            {
+                "stage": "search",
+                "version": "v2",
+                "top_n": top_n,
+                "session": session_id,
+                "model": self.settings.blip2_model_id,
+            }
+        )
+
+        search_results = self._load_json_cache(session_id, "vector_search", search_key) if use_resume else None
+        search_results = self._normalize_search_cache(search_results, expected_queries=len(anchors), top_n=top_n)
+        if search_results is None and use_resume:
+            legacy_search = self._load_latest_stage_json_cache(session_id, "vector_search")
+            legacy_search = self._normalize_search_cache(legacy_search, expected_queries=len(anchors), top_n=top_n)
+            if legacy_search is not None:
+                search_results = legacy_search
+                self._save_json_cache(session_id, "vector_search", search_key, search_results)
+                logger.info("[Pipeline] Reutilizando cache legacy de vector_search para session=%s", session_id)
+        if search_results is not None:
+            metrics.append(
+                Metric(
+                    stage="embeddings_and_milvus",
+                    seconds=0.0,
+                    vram_mb=self._vram_mb(),
+                    details={
+                        "anchors": len(anchors),
+                        "products": len(products),
+                        "batch_size": effective_batch,
+                        "cache_hit": True,
+                        "skipped": True,
+                        "reason": "vector_search_cache",
+                    },
+                )
+            )
+            metrics.append(
+                Metric(
+                    stage="vector_search",
+                    seconds=0.0,
+                    vram_mb=self._vram_mb(),
+                    details={
+                        "top_n": top_n,
+                        "queries": len(anchors),
+                        "candidates": len(anchors) * top_n,
+                        "cache_hit": True,
+                    },
+                )
+            )
 
         embed_key = self._cache_key(
             {
@@ -329,86 +508,106 @@ class MatchingPipeline:
             product_embeddings = self._load_npy_cache(session_id, "product_embeddings", embed_key)
             if anchor_embeddings is None or product_embeddings is None:
                 return None
-            products_collection = self._ensure_milvus_collections(
-                session_id,
-                anchors,
-                products,
-                anchor_embeddings,
-                product_embeddings,
-            )
+            products_collection: str | None = None
+            milvus_ready = False
+            try:
+                products_collection = self._ensure_milvus_collections(
+                    session_id,
+                    anchors,
+                    products,
+                    anchor_embeddings,
+                    product_embeddings,
+                )
+                milvus_ready = True
+            except Exception as exc:
+                logger.warning("[Pipeline] No se pudo rehidratar colecciones Milvus desde cache: %s", exc)
             return {
                 "anchor_embeddings": anchor_embeddings,
                 "product_embeddings": product_embeddings,
                 "products_collection": products_collection,
+                "milvus_ready": milvus_ready,
             }
 
         def compute_embeddings() -> dict[str, Any]:
-            all_items = anchors + products
-            all_embeddings = self.embedder.embed_records(all_items, effective_batch)
-            anchor_embeddings = all_embeddings[: len(anchors)]
-            product_embeddings = all_embeddings[len(anchors) :]
-            products_collection = self._ensure_milvus_collections(
-                session_id,
-                anchors,
-                products,
-                anchor_embeddings,
-                product_embeddings,
-            )
+            anchor_embeddings = self.embedder.embed_records(anchors, effective_batch)
+            product_embeddings, product_cache_stats = self._embed_products_with_global_cache(products, effective_batch)
+            products_collection: str | None = None
+            milvus_ready = False
+            try:
+                products_collection = self._ensure_milvus_collections(
+                    session_id,
+                    anchors,
+                    products,
+                    anchor_embeddings,
+                    product_embeddings,
+                )
+                milvus_ready = True
+            except Exception as exc:
+                logger.warning("[Pipeline] Milvus no disponible luego de embeddings: %s", exc)
             return {
                 "anchor_embeddings": anchor_embeddings,
                 "product_embeddings": product_embeddings,
                 "products_collection": products_collection,
+                "milvus_ready": milvus_ready,
+                "product_cache": product_cache_stats,
             }
 
         def save_embeddings_cached(payload: dict[str, Any]) -> None:
             self._save_npy_cache(session_id, "anchor_embeddings", embed_key, payload["anchor_embeddings"])
             self._save_npy_cache(session_id, "product_embeddings", embed_key, payload["product_embeddings"])
 
-        embeddings_payload, metric = self._run_cached_stage(
-            "embeddings_and_milvus",
-            read_cache=use_resume,
-            details={"anchors": len(anchors), "products": len(products), "batch_size": effective_batch},
-            load_fn=load_embeddings_cached,
-            compute_fn=compute_embeddings,
-            save_fn=save_embeddings_cached,
-        )
-        metrics.append(metric)
-
-        anchor_embeddings = embeddings_payload["anchor_embeddings"]
-        products_collection = embeddings_payload["products_collection"]
-
-        search_key = self._cache_key(
-            {
-                "stage": "search",
-                "version": "v2",
-                "top_n": top_n,
-                "session": session_id,
-                "model": self.settings.blip2_model_id,
-            }
-        )
-
-        def load_search_cached():
-            return self._load_json_cache(session_id, "vector_search", search_key)
-
-        def compute_search():
-            return self.vector_store.search(
-                collection_name=products_collection,
-                query_vectors=anchor_embeddings,
-                top_n=top_n,
+        if search_results is None:
+            embeddings_payload, metric = self._run_cached_stage(
+                "embeddings_and_milvus",
+                read_cache=use_resume,
+                details={"anchors": len(anchors), "products": len(products), "batch_size": effective_batch},
+                load_fn=load_embeddings_cached,
+                compute_fn=compute_embeddings,
+                save_fn=save_embeddings_cached,
             )
+            product_cache_stats = embeddings_payload.get("product_cache")
+            if isinstance(product_cache_stats, dict):
+                metric.details["product_cache_hits"] = int(product_cache_stats.get("hits", 0))
+                metric.details["product_cache_misses"] = int(product_cache_stats.get("misses", 0))
+            metrics.append(metric)
 
-        def save_search_cached(payload: Any) -> None:
-            self._save_json_cache(session_id, "vector_search", search_key, payload)
+            anchor_embeddings = embeddings_payload["anchor_embeddings"]
+            product_embeddings = embeddings_payload["product_embeddings"]
+            products_collection = embeddings_payload["products_collection"]
+            milvus_ready = bool(embeddings_payload.get("milvus_ready", False))
 
-        search_results, metric = self._run_cached_stage(
-            "vector_search",
-            read_cache=use_resume,
-            details={"top_n": top_n, "queries": len(anchors), "candidates": len(anchors) * top_n},
-            load_fn=load_search_cached,
-            compute_fn=compute_search,
-            save_fn=save_search_cached,
-        )
-        metrics.append(metric)
+            def load_search_cached():
+                return self._load_json_cache(session_id, "vector_search", search_key)
+
+            def compute_search():
+                if milvus_ready and products_collection:
+                    try:
+                        return self.vector_store.search(
+                            collection_name=products_collection,
+                            query_vectors=anchor_embeddings,
+                            top_n=top_n,
+                        )
+                    except Exception as exc:
+                        logger.warning("[Pipeline] Fallo busqueda Milvus, fallback local: %s", exc)
+                return self._local_vector_search(
+                    anchor_embeddings=anchor_embeddings,
+                    product_embeddings=product_embeddings,
+                    products=products,
+                    top_n=top_n,
+                )
+
+            def save_search_cached(payload: Any) -> None:
+                self._save_json_cache(session_id, "vector_search", search_key, payload)
+
+            search_results, metric = self._run_cached_stage(
+                "vector_search",
+                read_cache=use_resume,
+                details={"top_n": top_n, "queries": len(anchors), "candidates": len(anchors) * top_n},
+                load_fn=load_search_cached,
+                compute_fn=compute_search,
+                save_fn=save_search_cached,
+            )
+            metrics.append(metric)
 
         candidate_ids = {item["item_id"] for row in search_results for item in row}
         candidate_items = [product_by_id[candidate_id] for candidate_id in candidate_ids if candidate_id in product_by_id]
@@ -416,11 +615,12 @@ class MatchingPipeline:
         ner_key = self._cache_key(
             {
                 "stage": "ner",
-                "version": "v3",
+                "version": "v4",
                 "top_n": top_n,
                 "prompt": extraction_prompt_id,
                 "prompt_sig": extraction_prompt_sig,
-                "model": self.settings.qwen_ner_model_id,
+                "model": self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
+                "backend": "vllm" if self.settings.use_vllm else "transformers",
                 "items": len(anchors) + len(candidate_items),
             }
         )
@@ -512,52 +712,73 @@ class MatchingPipeline:
         for anchor_id, rows in grouped.items():
             grouped[anchor_id] = sorted(rows, key=lambda value: value["combined_score"], reverse=True)
 
-        validation_pairs: list[dict[str, Any]] = []
-        validation_map: list[tuple[str, str]] = []
+        validation_groups: list[dict[str, Any]] = []
+        validation_group_maps: list[dict[int, str]] = []
         validation_lookup: dict[str, dict[str, Any]] = {}
+        unresolved_candidates = 0
         for anchor in anchors:
             shortlisted = grouped[anchor["_id"]][:top_k]
+            anchor_prompt_attrs = self._attrs_for_validator_prompt(compact_attrs_by_id.get(anchor["_id"], {}))
+            group_candidates: list[dict[str, Any]] = []
+            local_map: dict[int, str] = {}
             for row in shortlisted:
                 candidate = product_by_id[row["candidate_id"]]
                 anchor_attrs = compact_attrs_by_id.get(anchor["_id"], {})
                 candidate_attrs = compact_attrs_by_id.get(candidate["_id"], {})
                 prompt_anchor_attrs = self._attrs_for_validator_prompt(anchor_attrs)
                 prompt_candidate_attrs = self._attrs_for_validator_prompt(candidate_attrs)
-                fast = self._fast_validator_decision(
-                    anchor_name=anchor["nombre"],
-                    candidate_name=candidate["nombre"],
-                    anchor_attrs=prompt_anchor_attrs,
-                    candidate_attrs=prompt_candidate_attrs,
-                    similarity=float(row["similarity"]),
-                    reranker_score=float(row["reranker_score"]),
-                )
+                fast = None
+                if use_fast_rules:
+                    fast = self._fast_validator_decision(
+                        anchor_name=anchor["nombre"],
+                        candidate_name=candidate["nombre"],
+                        anchor_attrs=prompt_anchor_attrs,
+                        candidate_attrs=prompt_candidate_attrs,
+                        similarity=float(row["similarity"]),
+                        reranker_score=float(row["reranker_score"]),
+                    )
                 key = f"{anchor['_id']}|{candidate['_id']}"
                 if fast is not None:
                     validation_lookup[key] = fast
                     continue
 
-                validation_pairs.append(
+                local_id = len(group_candidates) + 1
+                group_candidates.append(
                     {
-                        "anchor_name": anchor["nombre"],
-                        "anchor_attrs": prompt_anchor_attrs,
-                        "candidate_name": candidate["nombre"],
-                        "candidate_attrs": prompt_candidate_attrs,
+                        "id": local_id,
+                        "name": candidate.get("nombre"),
+                        "attrs": prompt_candidate_attrs,
                         "url": candidate.get("url_producto"),
                         "price": candidate.get("precioFinal"),
                     }
                 )
-                validation_map.append((anchor["_id"], candidate["_id"]))
+                local_map[local_id] = candidate["_id"]
+
+            if group_candidates:
+                unresolved_candidates += len(group_candidates)
+                validation_groups.append(
+                    {
+                        "anchor_id": anchor["_id"],
+                        "anchor_name": anchor["nombre"],
+                        "anchor_attrs": anchor_prompt_attrs,
+                        "candidates": group_candidates,
+                    }
+                )
+                validation_group_maps.append(local_map)
 
         validator_key = self._cache_key(
             {
                 "stage": "validator",
-                "version": "v3",
+                "version": "v5",
                 "top_n": top_n,
                 "top_k": top_k,
                 "prompt": validation_prompt_id,
                 "prompt_sig": validation_prompt_sig,
-                "model": self.settings.qwen_validator_model_id,
-                "pairs": len(validation_pairs),
+                "model": self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
+                "backend": "vllm" if self.settings.use_vllm else "transformers",
+                "use_fast_rules": use_fast_rules,
+                "groups": len(validation_groups),
+                "unresolved_candidates": unresolved_candidates,
                 "fast_resolved": len(validation_lookup),
             }
         )
@@ -566,8 +787,8 @@ class MatchingPipeline:
             return self._load_json_cache(session_id, "qwen_validator", validator_key)
 
         def compute_validator():
-            return self.validator.validate_pairs(
-                validation_pairs,
+            return self.validator.validate_groups(
+                validation_groups,
                 effective_validator_batch,
                 prompt_template=validation_prompt,
             )
@@ -577,26 +798,88 @@ class MatchingPipeline:
 
         validations, metric = self._run_cached_stage(
             "qwen_validator",
-            read_cache=use_resume and len(validation_pairs) > 0,
+            read_cache=use_resume and len(validation_groups) > 0,
             details={
-                "pairs": len(validation_pairs),
+                "groups": len(validation_groups),
+                "unresolved_candidates": unresolved_candidates,
                 "fast_resolved": len(validation_lookup),
+                "use_fast_rules": use_fast_rules,
                 "top_k": top_k,
                 "batch_size": effective_validator_batch,
                 "prompt": validation_prompt_id,
             },
             load_fn=load_validator_cached,
             compute_fn=compute_validator,
-            save_fn=save_validator_cached if len(validation_pairs) > 0 else None,
+            save_fn=save_validator_cached if len(validation_groups) > 0 else None,
         )
         metrics.append(metric)
 
-        validation_lookup.update(
-            {
-                f"{anchor_id}|{candidate_id}": validation
-                for (anchor_id, candidate_id), validation in zip(validation_map, validations)
-            }
-        )
+        for group, local_map, decision in zip(validation_groups, validation_group_maps, validations):
+            anchor_id = group["anchor_id"]
+            valid_rows = decision.get("matches_validos", []) if isinstance(decision, dict) else []
+            reject_rows = decision.get("rechazados", []) if isinstance(decision, dict) else []
+            unknown_rows = decision.get("sin_respuesta", []) if isinstance(decision, dict) else []
+
+            resolved_ids: set[int] = set()
+            for row in valid_rows:
+                try:
+                    local_id = int(row.get("id"))
+                except Exception:
+                    continue
+                candidate_id = local_map.get(local_id)
+                if not candidate_id:
+                    continue
+                resolved_ids.add(local_id)
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "validation_score": 0.95,
+                    "review_flag": False,
+                    "reason": str(row.get("razon", "match_valido"))[:120],
+                    "cantidad": int(row.get("cantidad", 1)) if str(row.get("cantidad", "")).isdigit() else 1,
+                    "decision": "aceptado",
+                }
+
+            for row in reject_rows:
+                try:
+                    local_id = int(row.get("id"))
+                except Exception:
+                    continue
+                candidate_id = local_map.get(local_id)
+                if not candidate_id:
+                    continue
+                resolved_ids.add(local_id)
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "validation_score": 0.05,
+                    "review_flag": True,
+                    "reason": str(row.get("razon", "rechazado"))[:120],
+                    "cantidad": None,
+                    "decision": "rechazado",
+                }
+
+            for row in unknown_rows:
+                try:
+                    local_id = int(row.get("id"))
+                except Exception:
+                    continue
+                candidate_id = local_map.get(local_id)
+                if not candidate_id:
+                    continue
+                resolved_ids.add(local_id)
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "review_flag": True,
+                    "reason": "sin_respuesta_modelo",
+                    "cantidad": None,
+                    "decision": "indeterminado",
+                }
+
+            for local_id, candidate_id in local_map.items():
+                if local_id in resolved_ids:
+                    continue
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "review_flag": True,
+                    "reason": "sin_respuesta_modelo",
+                    "cantidad": None,
+                    "decision": "indeterminado",
+                }
 
         final_results = []
         for anchor in anchors:
@@ -616,6 +899,9 @@ class MatchingPipeline:
                         "score_reranker": float(row["reranker_score"]),
                         "score_validacion": float(validation.get("validation_score", fallback_score)),
                         "revisar": bool(validation.get("review_flag", fallback_score < 0.66)),
+                        "razon_validacion": validation.get("reason"),
+                        "cantidad_match": validation.get("cantidad"),
+                        "decision_validacion": validation.get("decision"),
                         "atributos": compact_attrs_by_id.get(candidate["_id"], {}),
                         "sitio": candidate.get("sitio"),
                         "seller": candidate.get("seller"),
@@ -638,6 +924,7 @@ class MatchingPipeline:
             "use_resume": use_resume,
             "extraction_prompt_id": extraction_prompt_id,
             "validation_prompt_id": validation_prompt_id,
+            "use_fast_rules": use_fast_rules,
             "results": final_results,
             "metrics": [metric.__dict__ for metric in metrics],
         }

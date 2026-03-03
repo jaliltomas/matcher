@@ -2,15 +2,17 @@
 import axios from "axios";
 import { computed, onMounted, ref } from "vue";
 
-const apiBase = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const apiBase = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 
 const anchorFile = ref(null);
 const priceFiles = ref([]);
 const topN = ref(30);
+const topK = ref(5);
 const batchSize = ref(24);
 const nerBatchSize = ref(16);
 const validatorBatchSize = ref(8);
 const useResume = ref(true);
+const useFastRules = ref(true);
 const reuseSession = ref(true);
 const manualSessionId = ref("");
 
@@ -103,11 +105,12 @@ async function processMatching() {
     const matchResponse = await axios.post(`${apiBase}/match`, {
       session_id: sessionId,
       top_n: Number(topN.value) || 30,
-      top_k: 5,
+      top_k: Number(topK.value) || 5,
       batch_size: Number(batchSize.value) || 24,
       ner_batch_size: Number(nerBatchSize.value) || 16,
       validator_batch_size: Number(validatorBatchSize.value) || 8,
       use_resume: !!useResume.value,
+      use_fast_rules: !!useFastRules.value,
       extraction_prompt_id: extractionPromptId.value || null,
       validation_prompt_id: validationPromptId.value || null,
       extraction_prompt_text: extractionPromptText.value.trim() || null,
@@ -151,6 +154,11 @@ onMounted(loadPromptPresets);
         </label>
 
         <label class="field small">
+          <span>Top K final</span>
+          <input v-model.number="topK" type="number" min="1" max="20" />
+        </label>
+
+        <label class="field small">
           <span>Batch embeddings</span>
           <input v-model.number="batchSize" type="number" min="1" max="256" />
         </label>
@@ -183,6 +191,11 @@ onMounted(loadPromptPresets);
       <label class="resume-toggle">
         <input v-model="useResume" type="checkbox" />
         <span>Usar resume/cache por session para no recalcular etapas ya procesadas</span>
+      </label>
+
+      <label class="resume-toggle">
+        <input v-model="useFastRules" type="checkbox" />
+        <span>Usar fast rules antes del validator LLM</span>
       </label>
 
       <div class="prompt-columns">
@@ -235,10 +248,11 @@ onMounted(loadPromptPresets);
     </section>
 
     <section v-if="resultData" class="panel">
-      <h2>Resultados top 5 por ancla</h2>
+      <h2>Resultados top {{ resultData.top_k }} por ancla</h2>
       <p class="attrs">
         Resume: {{ resultData.use_resume ? "ON" : "OFF" }} | Prompt extraccion:
-        {{ resultData.extraction_prompt_id }} | Prompt validacion: {{ resultData.validation_prompt_id }}
+        {{ resultData.extraction_prompt_id }} | Prompt validacion: {{ resultData.validation_prompt_id }} | Fast rules:
+        {{ resultData.use_fast_rules === false ? "OFF" : "ON" }}
       </p>
 
       <div class="metrics">
@@ -280,6 +294,11 @@ onMounted(loadPromptPresets);
                 Sim: {{ formatScore(match.score_similitud) }} | Rerank:
                 {{ formatScore(match.score_reranker) }} | Val:
                 {{ formatScore(match.score_validacion) }}
+              </p>
+              <p v-if="match.decision_validacion || match.razon_validacion" class="attrs">
+                {{ match.decision_validacion || "decision" }}
+                <span v-if="match.cantidad_match"> | cantidad: {{ match.cantidad_match }}</span>
+                <span v-if="match.razon_validacion"> | razon: {{ match.razon_validacion }}</span>
               </p>
               <p class="attrs">Atributos: {{ JSON.stringify(match.atributos) }}</p>
             </div>

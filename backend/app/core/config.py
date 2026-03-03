@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     blip2_model_id: str = "Salesforce/blip2-opt-2.7b"
     qwen_ner_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
     qwen_validator_model_id: str = "Qwen/Qwen2.5-7B-Instruct"
+    use_vllm: bool = False
+    vllm_base_url: str = "http://127.0.0.1:8008/v1"
+    vllm_api_key: str = "EMPTY"
+    vllm_model_id: str = "Qwen/Qwen3.5-4B"
+    vllm_timeout_seconds: int = 120
+    vllm_max_retries: int = 2
+    vllm_disable_thinking: bool = True
+    vllm_max_parallel: int = 8
     reranker_model_id: str = "joeddav/xlm-roberta-large-xnli"
 
     device: str = Field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
