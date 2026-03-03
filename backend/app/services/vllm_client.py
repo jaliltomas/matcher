@@ -34,16 +34,23 @@ class VllmChatClient:
             "Content-Type": "application/json",
         }
 
-    def complete(self, prompt: str, max_tokens: int) -> str:
+    def complete(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        system_prompt: str = "Devuelve solo JSON valido sin texto adicional.",
+    ) -> str:
         payload: dict = {
             "model": self.model_id,
             "messages": [
-                {"role": "system", "content": "Devuelve solo JSON valido sin texto adicional."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             "max_tokens": int(max_tokens),
-            "temperature": 0.0,
-            "top_p": 0.95,
+            "temperature": float(temperature),
+            "top_p": float(top_p),
         }
         if self.disable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
@@ -74,9 +81,28 @@ class VllmChatClient:
                 time.sleep(sleep_seconds)
         raise RuntimeError(f"vLLM completion failed: {last_error}")
 
-    def complete_many(self, prompts: list[str], max_tokens: int, workers: int | None = None) -> list[str]:
+    def complete_many(
+        self,
+        prompts: list[str],
+        max_tokens: int,
+        workers: int | None = None,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        system_prompt: str = "Devuelve solo JSON valido sin texto adicional.",
+    ) -> list[str]:
         if not prompts:
             return []
         effective_workers = max(1, min(workers or self.max_parallel, self.max_parallel, len(prompts)))
         with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            return list(executor.map(lambda p: self.complete(p, max_tokens=max_tokens), prompts))
+            return list(
+                executor.map(
+                    lambda p: self.complete(
+                        p,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        system_prompt=system_prompt,
+                    ),
+                    prompts,
+                )
+            )

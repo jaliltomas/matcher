@@ -42,10 +42,14 @@ class Settings(BaseSettings):
     image_download_workers: int = 24
     image_timeout_seconds: int = 4
     max_new_tokens: int = 128
+    ner_max_new_tokens: int = 256
+    validator_max_new_tokens: int = 256
     offload_between_stages: bool = True
 
     top_n_default: int = 30
     top_k_default: int = 5
+    th_accept: float = 0.80
+    th_reject: float = 0.35
 
 
 @lru_cache(maxsize=1)

@@ -34,6 +34,7 @@ class QwenNerEnricherStage(EnricherStage):
         vllm_disable_thinking: bool,
         vllm_max_parallel: int,
         offload_between_stages: bool = True,
+        strict_json: bool = True,
     ) -> None:
         self.model_id = model_id
         self.device = device
@@ -41,6 +42,9 @@ class QwenNerEnricherStage(EnricherStage):
         self.max_new_tokens = max_new_tokens
         self.use_vllm = use_vllm
         self.offload_between_stages = offload_between_stages
+        self.strict_json = strict_json
+        self.parse_fail_count = 0
+        self.total_count = 0
 
         self.tokenizer: Any = None
         self.model: Any = None
@@ -104,9 +108,12 @@ class QwenNerEnricherStage(EnricherStage):
             return prompt_template.replace("{TEXT}", text)
 
         return (
-            "Extrae atributos de producto y responde SOLO JSON valido: "
-            '{"marca":null,"modelo":null,"categoria":null,"atributos":[],"unidad":null}. '
-            "Sin markdown ni texto extra. No inventes datos. Texto: "
+            "Extrae SOLO brand y category del texto de producto. "
+            "Responde SOLO JSON valido (sin markdown) con esquema exacto: "
+            '{"brand":null,"category":null,"evidence":{"brand":null,"category":null}}. '
+            "Reglas: (1) No adivinar. (2) Si no hay evidencia literal, usa null. "
+            "(3) evidence.brand y evidence.category deben ser substrings exactos del texto. "
+            "(4) No confundas seller/tienda con brand. Texto: "
             f"{text}"
         )
 
@@ -140,11 +147,42 @@ class QwenNerEnricherStage(EnricherStage):
             return 0
         return eos_ids[0] if len(eos_ids) == 1 else eos_ids
 
-    def _parse_json(self, output_text: str) -> dict[str, Any]:
+    def _empty_payload(self, raw_fallback: str | None = None) -> dict[str, Any]:
+        _ = raw_fallback
+        return {
+            "brand": None,
+            "category": None,
+            "evidence": {"brand": None, "category": None},
+        }
+
+    def _normalize_evidence(self, source_text: str, value: str | None) -> str | None:
+        if not value:
+            return None
+        quote = str(value).strip()
+        if not quote:
+            return None
+        return quote if quote in source_text else None
+
+    def _parse_json(self, source_text: str, output_text: str) -> dict[str, Any]:
         parsed = extract_first_json_object(output_text)
         if parsed is None:
-            return normalize_attributes({}, raw_fallback=output_text)
-        return normalize_attributes(parsed, raw_fallback=output_text)
+            self.parse_fail_count += 1
+            logger.warning("Qwen NER parse_fail: no JSON object")
+            return self._empty_payload(raw_fallback=output_text) if self.strict_json else normalize_attributes({}, raw_fallback=output_text)
+
+        normalized = normalize_attributes(parsed, raw_fallback=output_text)
+        evidence = normalized.get("evidence", {}) if isinstance(normalized.get("evidence"), dict) else {}
+        normalized["evidence"] = {
+            "brand": self._normalize_evidence(source_text, evidence.get("brand")),
+            "category": self._normalize_evidence(source_text, evidence.get("category")),
+        }
+        if self.strict_json:
+            normalized = {
+                "brand": normalized.get("brand"),
+                "category": normalized.get("category"),
+                "evidence": normalized.get("evidence", {"brand": None, "category": None}),
+            }
+        return normalized
 
     def _extract_with_vllm(
         self,
@@ -160,14 +198,16 @@ class QwenNerEnricherStage(EnricherStage):
             try:
                 outputs = self.vllm_client.complete_many(
                     prompts,
-                    max_tokens=min(self.max_new_tokens, 96),
+                    max_tokens=min(self.max_new_tokens, 256),
                     workers=min(batch_size, 8),
+                    temperature=0.0,
+                    top_p=1.0,
                 )
             except Exception as exc:
                 logger.warning("Qwen NER(vLLM) fallo: %s", exc)
                 raise
             for item, output in zip(batch, outputs):
-                result[item["_id"]] = self._parse_json(output)
+                result[item["_id"]] = self._parse_json(item.get("nombre", ""), output)
         return result
 
     # Etapa 4 del pipeline: enriquecimiento semantico con Qwen-7B para NER.
@@ -179,6 +219,8 @@ class QwenNerEnricherStage(EnricherStage):
     ) -> dict[str, dict[str, Any]]:
         if not items:
             return {}
+        self.parse_fail_count = 0
+        self.total_count = len(items)
 
         if self.use_vllm:
             try:
@@ -199,9 +241,10 @@ class QwenNerEnricherStage(EnricherStage):
             with torch.inference_mode():
                 generated = self.model.generate(
                     **encoded,
-                    max_new_tokens=min(self.max_new_tokens, 80),
+                    max_new_tokens=min(self.max_new_tokens, 256),
                     do_sample=False,
                     temperature=0.0,
+                    top_p=1.0,
                     num_beams=1,
                     use_cache=True,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -212,7 +255,7 @@ class QwenNerEnricherStage(EnricherStage):
             decoded = self.tokenizer.batch_decode(generated[:, prompt_length:], skip_special_tokens=True)
 
             for item, output in zip(batch, decoded):
-                result[item["_id"]] = self._parse_json(output)
+                result[item["_id"]] = self._parse_json(item.get("nombre", ""), output)
 
         self._unload()
         return result

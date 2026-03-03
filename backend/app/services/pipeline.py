@@ -16,7 +16,7 @@ from app.services.product_embedding_cache import ProductEmbeddingCache, product_
 from app.services.stages.base import EmbeddingStage, EnricherStage, RerankerStage, ValidatorStage
 from app.services.stages.blip2_embedder import Blip2EmbeddingStage
 from app.services.stages.qwen_enricher import QwenNerEnricherStage
-from app.services.stages.reranker import XlmrRerankerStage
+from app.services.stages.reranker import XlmrRerankerStage, build_pair_text
 from app.services.stages.validator import QwenValidatorStage
 from app.services.stages.json_parsing import normalize_attributes
 
@@ -54,7 +54,7 @@ class MatchingPipeline:
             model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
-            max_new_tokens=self.settings.max_new_tokens,
+            max_new_tokens=self.settings.ner_max_new_tokens,
             use_vllm=self.settings.use_vllm,
             vllm_base_url=self.settings.vllm_base_url,
             vllm_api_key=self.settings.vllm_api_key,
@@ -63,6 +63,7 @@ class MatchingPipeline:
             vllm_disable_thinking=self.settings.vllm_disable_thinking,
             vllm_max_parallel=self.settings.vllm_max_parallel,
             offload_between_stages=self.settings.offload_between_stages,
+            strict_json=True,
         )
         self.reranker = reranker or XlmrRerankerStage(
             model_id=self.settings.reranker_model_id,
@@ -74,7 +75,7 @@ class MatchingPipeline:
             model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
-            max_new_tokens=self.settings.max_new_tokens,
+            max_new_tokens=self.settings.validator_max_new_tokens,
             use_vllm=self.settings.use_vllm,
             vllm_base_url=self.settings.vllm_base_url,
             vllm_api_key=self.settings.vllm_api_key,
@@ -151,11 +152,8 @@ class MatchingPipeline:
     def _attrs_for_validator_prompt(self, attrs: dict[str, Any]) -> dict[str, Any]:
         clean = self._compact_attrs(attrs)
         return {
-            "marca": clean.get("marca"),
-            "modelo": clean.get("modelo"),
-            "categoria": clean.get("categoria"),
-            "unidad": clean.get("unidad"),
-            "atributos": (clean.get("atributos") or [])[:5],
+            "brand": clean.get("brand"),
+            "category": clean.get("category"),
         }
 
     def _local_vector_search(
@@ -199,10 +197,10 @@ class MatchingPipeline:
         similarity: float,
         reranker_score: float,
     ) -> dict[str, Any] | None:
-        anchor_brand = (anchor_attrs.get("marca") or "").strip().lower()
-        candidate_brand = (candidate_attrs.get("marca") or "").strip().lower()
-        anchor_unit = (anchor_attrs.get("unidad") or "").strip().lower()
-        candidate_unit = (candidate_attrs.get("unidad") or "").strip().lower()
+        anchor_brand = (anchor_attrs.get("brand") or "").strip().lower()
+        candidate_brand = (candidate_attrs.get("brand") or "").strip().lower()
+        anchor_category = (anchor_attrs.get("category") or "").strip().lower()
+        candidate_category = (candidate_attrs.get("category") or "").strip().lower()
 
         if anchor_brand and candidate_brand and anchor_brand != candidate_brand:
             return {
@@ -211,11 +209,11 @@ class MatchingPipeline:
                 "reason": "brand_mismatch_fast_rule",
             }
 
-        if anchor_unit and candidate_unit and anchor_unit != candidate_unit:
+        if anchor_category and candidate_category and anchor_category != candidate_category:
             return {
-                "validation_score": 0.20,
+                "validation_score": 0.12,
                 "review_flag": True,
-                "reason": "unit_mismatch_fast_rule",
+                "reason": "category_mismatch_fast_rule",
             }
 
         anchor_norm = self._normalize_text(anchor_name)
@@ -226,7 +224,6 @@ class MatchingPipeline:
             similarity >= 0.95
             and overlap >= 0.60
             and (not anchor_brand or not candidate_brand or anchor_brand == candidate_brand)
-            and (not anchor_unit or not candidate_unit or anchor_unit == candidate_unit)
         ):
             return {
                 "validation_score": min(0.99, 0.80 + 0.19 * similarity),
@@ -430,10 +427,14 @@ class MatchingPipeline:
         validation_prompt: str | None = None,
         extraction_prompt_id: str = "default",
         validation_prompt_id: str = "default",
+        th_accept: float | None = None,
+        th_reject: float | None = None,
     ) -> dict[str, Any]:
         effective_batch = batch_size or self.settings.batch_size
         effective_ner_batch = ner_batch_size or max(1, effective_batch // 2)
         effective_validator_batch = validator_batch_size or max(1, effective_batch // 2)
+        effective_th_accept = float(self.settings.th_accept if th_accept is None else th_accept)
+        effective_th_reject = float(self.settings.th_reject if th_reject is None else th_reject)
         metrics: list[Metric] = []
         session_id = session_data["session_id"]
         extraction_prompt_sig = hashlib.sha1((extraction_prompt or "").encode("utf-8")).hexdigest()[:10]
@@ -622,6 +623,11 @@ class MatchingPipeline:
                 "model": self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
                 "backend": "vllm" if self.settings.use_vllm else "transformers",
                 "items": len(anchors) + len(candidate_items),
+                "text_sig": hashlib.sha1(
+                    "\n".join(
+                        sorted(self._normalize_text(item.get("nombre", "")) for item in (anchors + candidate_items))
+                    ).encode("utf-8")
+                ).hexdigest()[:12],
             }
         )
 
@@ -651,6 +657,7 @@ class MatchingPipeline:
             compute_fn=compute_ner,
             save_fn=save_ner_cached,
         )
+        metric.details["parse_fail_count"] = int(getattr(self.enricher, "parse_fail_count", 0))
         metrics.append(metric)
 
         compact_attrs_by_id = {item_id: self._compact_attrs(attrs) for item_id, attrs in attributes_by_id.items()}
@@ -666,8 +673,20 @@ class MatchingPipeline:
                         "anchor_text": anchor["nombre"],
                         "candidate_text": candidate["nombre"],
                         "similarity": hit["similarity"],
+                        "anchor_ner": compact_attrs_by_id.get(anchor["_id"], {}),
+                        "candidate_ner": compact_attrs_by_id.get(candidate["_id"], {}),
                     }
                 )
+
+        for pair in base_pairs:
+            text_a, text_b = build_pair_text(
+                anchor_text=pair["anchor_text"],
+                candidate_text=pair["candidate_text"],
+                anchor_ner=pair.get("anchor_ner", {}),
+                candidate_ner=pair.get("candidate_ner", {}),
+            )
+            pair["text_a"] = text_a
+            pair["text_b"] = text_b
 
         reranker_key = self._cache_key(
             {
@@ -713,14 +732,11 @@ class MatchingPipeline:
             grouped[anchor_id] = sorted(rows, key=lambda value: value["combined_score"], reverse=True)
 
         validation_groups: list[dict[str, Any]] = []
-        validation_group_maps: list[dict[int, str]] = []
         validation_lookup: dict[str, dict[str, Any]] = {}
         unresolved_candidates = 0
         for anchor in anchors:
             shortlisted = grouped[anchor["_id"]][:top_k]
             anchor_prompt_attrs = self._attrs_for_validator_prompt(compact_attrs_by_id.get(anchor["_id"], {}))
-            group_candidates: list[dict[str, Any]] = []
-            local_map: dict[int, str] = {}
             for row in shortlisted:
                 candidate = product_by_id[row["candidate_id"]]
                 anchor_attrs = compact_attrs_by_id.get(anchor["_id"], {})
@@ -737,39 +753,51 @@ class MatchingPipeline:
                         similarity=float(row["similarity"]),
                         reranker_score=float(row["reranker_score"]),
                     )
+                if fast is None and float(row["reranker_score"]) >= effective_th_accept:
+                    if (
+                        not prompt_anchor_attrs.get("brand")
+                        or not prompt_candidate_attrs.get("brand")
+                        or str(prompt_anchor_attrs.get("brand")).strip().lower()
+                        == str(prompt_candidate_attrs.get("brand")).strip().lower()
+                    ):
+                        fast = {
+                            "validation_score": min(0.99, 0.85 + 0.1 * float(row["reranker_score"])),
+                            "review_flag": False,
+                            "reason": "threshold_accept_fast_rule",
+                            "decision": "aceptado",
+                        }
+                if fast is None and float(row["reranker_score"]) <= effective_th_reject:
+                    fast = {
+                        "validation_score": 0.05,
+                        "review_flag": True,
+                        "reason": "threshold_reject_fast_rule",
+                        "decision": "rechazado",
+                    }
                 key = f"{anchor['_id']}|{candidate['_id']}"
                 if fast is not None:
                     validation_lookup[key] = fast
                     continue
 
-                local_id = len(group_candidates) + 1
-                group_candidates.append(
-                    {
-                        "id": local_id,
-                        "name": candidate.get("nombre"),
-                        "attrs": prompt_candidate_attrs,
-                        "url": candidate.get("url_producto"),
-                        "price": candidate.get("precioFinal"),
-                    }
-                )
-                local_map[local_id] = candidate["_id"]
-
-            if group_candidates:
-                unresolved_candidates += len(group_candidates)
+                unresolved_candidates += 1
                 validation_groups.append(
                     {
                         "anchor_id": anchor["_id"],
+                        "candidate_id": candidate["_id"],
                         "anchor_name": anchor["nombre"],
                         "anchor_attrs": anchor_prompt_attrs,
-                        "candidates": group_candidates,
+                        "candidate": {
+                            "name": candidate.get("nombre"),
+                            "attrs": prompt_candidate_attrs,
+                            "url": candidate.get("url_producto"),
+                            "price": candidate.get("precioFinal"),
+                        },
                     }
                 )
-                validation_group_maps.append(local_map)
 
         validator_key = self._cache_key(
             {
                 "stage": "validator",
-                "version": "v5",
+                "version": "v6",
                 "top_n": top_n,
                 "top_k": top_k,
                 "prompt": validation_prompt_id,
@@ -814,69 +842,47 @@ class MatchingPipeline:
         )
         metrics.append(metric)
 
-        for group, local_map, decision in zip(validation_groups, validation_group_maps, validations):
+        for group, decision in zip(validation_groups, validations):
             anchor_id = group["anchor_id"]
-            valid_rows = decision.get("matches_validos", []) if isinstance(decision, dict) else []
-            reject_rows = decision.get("rechazados", []) if isinstance(decision, dict) else []
-            unknown_rows = decision.get("sin_respuesta", []) if isinstance(decision, dict) else []
-
-            resolved_ids: set[int] = set()
-            for row in valid_rows:
-                try:
-                    local_id = int(row.get("id"))
-                except Exception:
-                    continue
-                candidate_id = local_map.get(local_id)
-                if not candidate_id:
-                    continue
-                resolved_ids.add(local_id)
-                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
-                    "validation_score": 0.95,
-                    "review_flag": False,
-                    "reason": str(row.get("razon", "match_valido"))[:120],
-                    "cantidad": int(row.get("cantidad", 1)) if str(row.get("cantidad", "")).isdigit() else 1,
-                    "decision": "aceptado",
-                }
-
-            for row in reject_rows:
-                try:
-                    local_id = int(row.get("id"))
-                except Exception:
-                    continue
-                candidate_id = local_map.get(local_id)
-                if not candidate_id:
-                    continue
-                resolved_ids.add(local_id)
-                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
-                    "validation_score": 0.05,
-                    "review_flag": True,
-                    "reason": str(row.get("razon", "rechazado"))[:120],
-                    "cantidad": None,
-                    "decision": "rechazado",
-                }
-
-            for row in unknown_rows:
-                try:
-                    local_id = int(row.get("id"))
-                except Exception:
-                    continue
-                candidate_id = local_map.get(local_id)
-                if not candidate_id:
-                    continue
-                resolved_ids.add(local_id)
+            candidate_id = group["candidate_id"]
+            if not isinstance(decision, dict):
                 validation_lookup[f"{anchor_id}|{candidate_id}"] = {
                     "review_flag": True,
                     "reason": "sin_respuesta_modelo",
                     "cantidad": None,
                     "decision": "indeterminado",
                 }
+                continue
 
-            for local_id, candidate_id in local_map.items():
-                if local_id in resolved_ids:
-                    continue
+            model_decision = str(decision.get("decision", "REVIEW")).upper()
+            reason_code = str(decision.get("reason_code", "AMBIGUOUS"))
+            confidence = float(decision.get("confidence", 0.5))
+            evidence = decision.get("evidence", [])
+            reason = reason_code
+            if isinstance(evidence, list) and evidence:
+                reason = f"{reason_code}: {' | '.join(str(item) for item in evidence[:2])}"[:120]
+
+            if model_decision == "ACCEPT":
                 validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "validation_score": max(0.7, confidence),
+                    "review_flag": False,
+                    "reason": reason,
+                    "cantidad": 1,
+                    "decision": "aceptado",
+                }
+            elif model_decision == "REJECT":
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "validation_score": min(0.3, max(0.0, 1.0 - confidence)),
                     "review_flag": True,
-                    "reason": "sin_respuesta_modelo",
+                    "reason": reason,
+                    "cantidad": None,
+                    "decision": "rechazado",
+                }
+            else:
+                validation_lookup[f"{anchor_id}|{candidate_id}"] = {
+                    "validation_score": confidence,
+                    "review_flag": True,
+                    "reason": reason,
                     "cantidad": None,
                     "decision": "indeterminado",
                 }
@@ -925,6 +931,7 @@ class MatchingPipeline:
             "extraction_prompt_id": extraction_prompt_id,
             "validation_prompt_id": validation_prompt_id,
             "use_fast_rules": use_fast_rules,
+            "thresholds": {"accept": effective_th_accept, "reject": effective_th_reject},
             "results": final_results,
             "metrics": [metric.__dict__ for metric in metrics],
         }

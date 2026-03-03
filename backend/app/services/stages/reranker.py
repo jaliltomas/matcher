@@ -1,5 +1,6 @@
 import logging
 import math
+import re
 from typing import Any
 
 import torch
@@ -14,6 +15,53 @@ logger = logging.getLogger(__name__)
 def _chunks(data: list[dict[str, Any]], batch_size: int):
     for i in range(0, len(data), batch_size):
         yield data[i : i + batch_size]
+
+
+def _norm(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip().lower())
+
+
+def _match_hint(left: str | None, right: str | None) -> str:
+    l_norm = _norm(left)
+    r_norm = _norm(right)
+    if l_norm and r_norm:
+        return "yes" if l_norm == r_norm else "no"
+    return "unknown"
+
+
+def build_pair_text(
+    anchor_text: str,
+    candidate_text: str,
+    anchor_ner: dict[str, Any] | None,
+    candidate_ner: dict[str, Any] | None,
+) -> tuple[str, str]:
+    anchor_ner = anchor_ner or {}
+    candidate_ner = candidate_ner or {}
+
+    anchor_brand = anchor_ner.get("brand")
+    anchor_category = anchor_ner.get("category")
+    candidate_brand = candidate_ner.get("brand")
+    candidate_category = candidate_ner.get("category")
+
+    brand_match = _match_hint(anchor_brand, candidate_brand)
+    category_match = _match_hint(anchor_category, candidate_category)
+
+    text_a = (
+        f"ANCHOR_RAW: {anchor_text}\n"
+        f"ANCHOR_BRAND: {anchor_brand or 'null'}\n"
+        f"ANCHOR_CATEGORY: {anchor_category or 'null'}"
+    )
+    text_b = (
+        f"CANDIDATE_RAW: {candidate_text}\n"
+        f"CANDIDATE_BRAND: {candidate_brand or 'null'}\n"
+        f"CANDIDATE_CATEGORY: {candidate_category or 'null'}\n\n"
+        "HINTS:\n"
+        f"BRAND_MATCH: {brand_match}\n"
+        f"CATEGORY_MATCH: {category_match}"
+    )
+    return text_a, text_b
 
 
 class XlmrRerankerStage(RerankerStage):
@@ -80,8 +128,8 @@ class XlmrRerankerStage(RerankerStage):
         total_batches = math.ceil(len(pairs) / batch_size)
 
         for batch in tqdm(_chunks(pairs, batch_size), total=total_batches, desc="Reranker", leave=False):
-            left = [item["anchor_text"] for item in batch]
-            right = [item["candidate_text"] for item in batch]
+            left = [item.get("text_a") or item["anchor_text"] for item in batch]
+            right = [item.get("text_b") or item["candidate_text"] for item in batch]
 
             encoded = self.tokenizer(
                 left,

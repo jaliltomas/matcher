@@ -13,6 +13,16 @@ from app.services.stages.base import ValidatorStage
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_DECISIONS = {"ACCEPT", "REJECT", "REVIEW"}
+_ALLOWED_REASON_CODES = {
+    "SAME_PRODUCT",
+    "BRAND_MISMATCH",
+    "CATEGORY_MISMATCH",
+    "INSUFFICIENT_EVIDENCE",
+    "TOO_GENERIC",
+    "AMBIGUOUS",
+}
+
 
 def _chunks(data: list[dict[str, Any]], batch_size: int):
     for i in range(0, len(data), batch_size):
@@ -100,22 +110,37 @@ class QwenValidatorStage(ValidatorStage):
             torch.cuda.empty_cache()
 
     def _prompt(self, group: dict[str, Any], prompt_template: str | None) -> str:
-        candidates_json = json.dumps(group["candidates"], ensure_ascii=False)
+        candidate = group["candidate"]
+        payload = {
+            "anchor": {
+                "name": group["anchor_name"],
+                "attrs": group.get("anchor_attrs", {}),
+            },
+            "candidate": {
+                "name": candidate.get("name"),
+                "attrs": candidate.get("attrs", {}),
+                "url": candidate.get("url"),
+                "price": candidate.get("price"),
+            },
+        }
         if prompt_template:
             prompt = prompt_template
             prompt = prompt.replace("{ANCHOR_NAME}", str(group["anchor_name"]))
             prompt = prompt.replace("{ANCHOR_ATTRS}", json.dumps(group["anchor_attrs"], ensure_ascii=False))
-            prompt = prompt.replace("{CANDIDATES_JSON}", candidates_json)
+            prompt = prompt.replace("{CANDIDATES_JSON}", json.dumps([candidate], ensure_ascii=False))
+            prompt = prompt.replace("{PAIR_JSON}", json.dumps(payload, ensure_ascii=False))
             return prompt
 
         return (
-            "Evalua candidatos contra un ancla y decide si son el mismo SKU. "
-            "Responde SOLO JSON valido (sin texto extra) con formato exacto:\n"
-            '{"matches_validos":[{"id":1,"razon":"","cantidad":1}],"rechazados":[{"id":2,"razon":""}]}.\n'
-            "Todos los candidatos deben quedar en una de las listas.\n"
-            f"ANCLA: {group['anchor_name']}\n"
-            f"ATRIBUTOS_ANCLA: {json.dumps(group['anchor_attrs'], ensure_ascii=False)}\n"
-            f"CANDIDATOS: {candidates_json}"
+            "Eres un auditor de matching de productos. Evalua SOLO un par anchor-candidate. "
+            "Responde SOLO JSON valido con esquema exacto: "
+            '{"decision":"ACCEPT|REJECT|REVIEW","reason_code":"SAME_PRODUCT|BRAND_MISMATCH|CATEGORY_MISMATCH|INSUFFICIENT_EVIDENCE|TOO_GENERIC|AMBIGUOUS","confidence":0.0,"evidence":[]}. '
+            "Reglas duras: (1) si ambas brands existen y difieren => REJECT con confidence >= 0.9 y reason_code BRAND_MISMATCH. "
+            "(2) Si category existe en ambos y difiere claramente => REJECT con CATEGORY_MISMATCH. "
+            "(3) Si no puedes citar evidencia textual exacta que soporte ACCEPT => usa REVIEW. "
+            "(4) evidence debe contener hasta 3 substrings exactos del texto de entrada. "
+            "(5) Nunca inventes brand/category faltantes.\n"
+            f"PAIR_JSON: {json.dumps(payload, ensure_ascii=False)}"
         )
 
     def _build_batch_inputs(self, prompts: list[str]):
@@ -139,8 +164,9 @@ class QwenValidatorStage(ValidatorStage):
     def _eos_token_ids(self) -> list[int] | int:
         assert self.tokenizer is not None
         eos_ids: list[int] = []
-        if self.tokenizer.eos_token_id is not None:
-            eos_ids.append(int(self.tokenizer.eos_token_id))
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos_token_id, int):
+            eos_ids.append(eos_token_id)
         im_end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         if isinstance(im_end_id, int) and im_end_id >= 0:
             eos_ids.append(im_end_id)
@@ -148,60 +174,84 @@ class QwenValidatorStage(ValidatorStage):
             return 0
         return eos_ids[0] if len(eos_ids) == 1 else eos_ids
 
-    def _parse_json(self, output_text: str, allowed_ids: list[int]) -> dict[str, Any]:
+    def _clean_evidence(self, pair_text: str, evidence: Any) -> list[str]:
+        if not isinstance(evidence, list):
+            return []
+        out: list[str] = []
+        for item in evidence:
+            quote = str(item).strip()
+            if not quote:
+                continue
+            if quote in pair_text:
+                out.append(quote[:120])
+            if len(out) >= 3:
+                break
+        return out
+
+    def _parse_auditor_json(self, output_text: str, pair_text: str) -> dict[str, Any]:
         parsed = extract_first_json_object(output_text)
+        fallback = {
+            "decision": "REVIEW",
+            "reason_code": "INSUFFICIENT_EVIDENCE",
+            "confidence": 0.5,
+            "evidence": [],
+        }
+        if not isinstance(parsed, dict):
+            return fallback
 
-        allowed = {int(value) for value in allowed_ids}
-        matches_validos: list[dict[str, Any]] = []
-        rechazados: list[dict[str, Any]] = []
+        decision = str(parsed.get("decision", "REVIEW")).upper()
+        reason_code = str(parsed.get("reason_code", "INSUFFICIENT_EVIDENCE")).upper()
+        try:
+            confidence = float(parsed.get("confidence", 0.5))
+        except Exception:
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+        evidence = self._clean_evidence(pair_text, parsed.get("evidence", []))
 
-        if isinstance(parsed, dict):
-            raw_matches = parsed.get("matches_validos", [])
-            raw_rejects = parsed.get("rechazados", [])
+        if decision not in _ALLOWED_DECISIONS:
+            decision = "REVIEW"
+        if reason_code not in _ALLOWED_REASON_CODES:
+            reason_code = "AMBIGUOUS"
+        if decision == "ACCEPT" and not evidence:
+            decision = "REVIEW"
+            reason_code = "INSUFFICIENT_EVIDENCE"
 
-            if isinstance(raw_matches, list):
-                for row in raw_matches:
-                    if not isinstance(row, dict):
-                        continue
-                    try:
-                        idx = int(row.get("id"))
-                    except Exception:
-                        continue
-                    if idx not in allowed:
-                        continue
-                    reason = str(row.get("razon", "match"))[:80]
-                    try:
-                        quantity = int(row.get("cantidad", 1))
-                    except Exception:
-                        quantity = 1
-                    matches_validos.append({"id": idx, "razon": reason, "cantidad": max(1, quantity)})
+        return {
+            "decision": decision,
+            "reason_code": reason_code,
+            "confidence": confidence,
+            "evidence": evidence,
+        }
 
-            if isinstance(raw_rejects, list):
-                for row in raw_rejects:
-                    if not isinstance(row, dict):
-                        continue
-                    try:
-                        idx = int(row.get("id"))
-                    except Exception:
-                        continue
-                    if idx not in allowed:
-                        continue
-                    reason = str(row.get("razon", "rechazado"))[:100]
-                    rechazados.append({"id": idx, "razon": reason})
+    def _hard_rule_override(self, group: dict[str, Any]) -> dict[str, Any] | None:
+        anchor_attrs = group.get("anchor_attrs", {}) if isinstance(group.get("anchor_attrs"), dict) else {}
+        candidate = group.get("candidate", {}) if isinstance(group.get("candidate"), dict) else {}
+        candidate_attrs = candidate.get("attrs", {}) if isinstance(candidate.get("attrs"), dict) else {}
 
-        valid_ids = {item["id"] for item in matches_validos}
-        reject_ids = {item["id"] for item in rechazados}
-        missing = [idx for idx in allowed_ids if idx not in valid_ids and idx not in reject_ids]
-        sin_respuesta = [{"id": int(idx), "razon": "sin_respuesta_modelo"} for idx in missing]
+        a_brand = str(anchor_attrs.get("brand") or "").strip().lower()
+        c_brand = str(candidate_attrs.get("brand") or "").strip().lower()
+        if a_brand and c_brand and a_brand != c_brand:
+            return {
+                "decision": "REJECT",
+                "reason_code": "BRAND_MISMATCH",
+                "confidence": 0.95,
+                "evidence": [a_brand[:80], c_brand[:80]],
+            }
 
-        return {"matches_validos": matches_validos, "rechazados": rechazados, "sin_respuesta": sin_respuesta}
+        a_cat = str(anchor_attrs.get("category") or "").strip().lower()
+        c_cat = str(candidate_attrs.get("category") or "").strip().lower()
+        if a_cat and c_cat and a_cat != c_cat:
+            return {
+                "decision": "REJECT",
+                "reason_code": "CATEGORY_MISMATCH",
+                "confidence": 0.92,
+                "evidence": [a_cat[:80], c_cat[:80]],
+            }
+        return None
 
     def _max_new_tokens_for_batch(self, batch: list[dict[str, Any]]) -> int:
-        estimated = 0
-        for group in batch:
-            candidates = len(group.get("candidates", []))
-            estimated = max(estimated, 48 + (24 * candidates))
-        return int(min(384, max(self.max_new_tokens, estimated)))
+        _ = batch
+        return int(min(384, max(128, self.max_new_tokens)))
 
     def _validate_with_vllm(
         self,
@@ -214,19 +264,23 @@ class QwenValidatorStage(ValidatorStage):
         total_batches = math.ceil(len(groups) / batch_size)
         for batch in tqdm(_chunks(groups, batch_size), total=total_batches, desc="Validator(vLLM)", leave=False):
             prompts = [self._prompt(group, prompt_template) for group in batch]
-            max_tokens = self._max_new_tokens_for_batch(batch)
+            max_tokens = max(128, self._max_new_tokens_for_batch(batch))
             try:
                 decoded = self.vllm_client.complete_many(
                     prompts,
                     max_tokens=max_tokens,
                     workers=min(batch_size, 4),
+                    temperature=0.0,
+                    top_p=1.0,
                 )
             except Exception as exc:
                 logger.warning("Qwen Validator(vLLM) fallo: %s", exc)
                 raise
             for text, group in zip(decoded, batch):
-                allowed_ids = [int(item.get("id")) for item in group.get("candidates", []) if "id" in item]
-                outputs.append(self._parse_json(text, allowed_ids))
+                pair_text = f"{group.get('anchor_name','')} || {group.get('candidate',{}).get('name','')}"
+                parsed = self._parse_auditor_json(text, pair_text)
+                override = self._hard_rule_override(group)
+                outputs.append(override or parsed)
         return outputs
 
     # Etapa 6 del pipeline: validacion final por ancla devolviendo aceptados y rechazados.
@@ -262,6 +316,7 @@ class QwenValidatorStage(ValidatorStage):
                     max_new_tokens=max_tokens,
                     do_sample=False,
                     temperature=0.0,
+                    top_p=1.0,
                     num_beams=1,
                     use_cache=True,
                     pad_token_id=self.tokenizer.pad_token_id,
@@ -271,8 +326,10 @@ class QwenValidatorStage(ValidatorStage):
             prompt_length = encoded["input_ids"].shape[1]
             decoded = self.tokenizer.batch_decode(generated[:, prompt_length:], skip_special_tokens=True)
             for text, group in zip(decoded, batch):
-                allowed_ids = [int(item.get("id")) for item in group.get("candidates", []) if "id" in item]
-                outputs.append(self._parse_json(text, allowed_ids))
+                pair_text = f"{group.get('anchor_name','')} || {group.get('candidate',{}).get('name','')}"
+                parsed = self._parse_auditor_json(text, pair_text)
+                override = self._hard_rule_override(group)
+                outputs.append(override or parsed)
 
         self._unload()
         return outputs
