@@ -7,9 +7,9 @@ import torch
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from app.services.vllm_client import VllmChatClient
-from app.services.stages.json_parsing import extract_first_json_object
 from app.services.stages.base import ValidatorStage
+from app.services.stages.json_parsing import extract_first_json_object
+from app.services.vllm_client import VllmChatClient
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,8 @@ class QwenValidatorStage(ValidatorStage):
         vllm_max_retries: int,
         vllm_disable_thinking: bool,
         vllm_max_parallel: int,
+        vllm_context_window: int,
+        vllm_context_reserve: int,
         offload_between_stages: bool = True,
     ) -> None:
         self.model_id = model_id
@@ -51,6 +53,8 @@ class QwenValidatorStage(ValidatorStage):
         self.max_new_tokens = max_new_tokens
         self.use_vllm = use_vllm
         self.offload_between_stages = offload_between_stages
+        self.vllm_context_window = max(256, int(vllm_context_window))
+        self.vllm_context_reserve = max(0, int(vllm_context_reserve))
 
         self.tokenizer: Any = None
         self.model: Any = None
@@ -85,7 +89,9 @@ class QwenValidatorStage(ValidatorStage):
             return
 
         logger.info("Cargando Qwen Validator: %s", self.model_id)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id, trust_remote_code=True
+        )
         self.tokenizer.padding_side = "left"
         if getattr(self.tokenizer, "pad_token_id", None) is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -126,9 +132,15 @@ class QwenValidatorStage(ValidatorStage):
         if prompt_template:
             prompt = prompt_template
             prompt = prompt.replace("{ANCHOR_NAME}", str(group["anchor_name"]))
-            prompt = prompt.replace("{ANCHOR_ATTRS}", json.dumps(group["anchor_attrs"], ensure_ascii=False))
-            prompt = prompt.replace("{CANDIDATES_JSON}", json.dumps([candidate], ensure_ascii=False))
-            prompt = prompt.replace("{PAIR_JSON}", json.dumps(payload, ensure_ascii=False))
+            prompt = prompt.replace(
+                "{ANCHOR_ATTRS}", json.dumps(group["anchor_attrs"], ensure_ascii=False)
+            )
+            prompt = prompt.replace(
+                "{CANDIDATES_JSON}", json.dumps([candidate], ensure_ascii=False)
+            )
+            prompt = prompt.replace(
+                "{PAIR_JSON}", json.dumps(payload, ensure_ascii=False)
+            )
             return prompt
 
         return (
@@ -148,7 +160,10 @@ class QwenValidatorStage(ValidatorStage):
         if hasattr(self.tokenizer, "apply_chat_template"):
             messages = [
                 [
-                    {"role": "system", "content": "Devuelve solo JSON valido sin explicaciones."},
+                    {
+                        "role": "system",
+                        "content": "Devuelve solo JSON valido sin explicaciones.",
+                    },
                     {"role": "user", "content": prompt},
                 ]
                 for prompt in prompts
@@ -158,8 +173,12 @@ class QwenValidatorStage(ValidatorStage):
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            return self.tokenizer(rendered, return_tensors="pt", padding=True, truncation=True)
-        return self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+            return self.tokenizer(
+                rendered, return_tensors="pt", padding=True, truncation=True
+            )
+        return self.tokenizer(
+            prompts, return_tensors="pt", padding=True, truncation=True
+        )
 
     def _eos_token_ids(self) -> list[int] | int:
         assert self.tokenizer is not None
@@ -224,9 +243,21 @@ class QwenValidatorStage(ValidatorStage):
         }
 
     def _hard_rule_override(self, group: dict[str, Any]) -> dict[str, Any] | None:
-        anchor_attrs = group.get("anchor_attrs", {}) if isinstance(group.get("anchor_attrs"), dict) else {}
-        candidate = group.get("candidate", {}) if isinstance(group.get("candidate"), dict) else {}
-        candidate_attrs = candidate.get("attrs", {}) if isinstance(candidate.get("attrs"), dict) else {}
+        anchor_attrs = (
+            group.get("anchor_attrs", {})
+            if isinstance(group.get("anchor_attrs"), dict)
+            else {}
+        )
+        candidate = (
+            group.get("candidate", {})
+            if isinstance(group.get("candidate"), dict)
+            else {}
+        )
+        candidate_attrs = (
+            candidate.get("attrs", {})
+            if isinstance(candidate.get("attrs"), dict)
+            else {}
+        )
 
         a_brand = str(anchor_attrs.get("brand") or "").strip().lower()
         c_brand = str(candidate_attrs.get("brand") or "").strip().lower()
@@ -249,9 +280,22 @@ class QwenValidatorStage(ValidatorStage):
             }
         return None
 
-    def _max_new_tokens_for_batch(self, batch: list[dict[str, Any]]) -> int:
-        _ = batch
-        return int(min(384, max(128, self.max_new_tokens)))
+    def _estimate_prompt_tokens(self, prompt: str) -> int:
+        # Estimacion conservadora para servidores OpenAI-compatible (LM Studio/vLLM).
+        # Evita exceder contexto por reservar demasiados tokens de salida.
+        return max(1, len(prompt) // 4)
+
+    def _max_new_tokens_for_prompts(self, prompts: list[str]) -> int:
+        if not prompts:
+            return 1
+        available_per_prompt = []
+        for prompt in prompts:
+            prompt_tokens = self._estimate_prompt_tokens(prompt)
+            available = self.vllm_context_window - prompt_tokens - self.vllm_context_reserve
+            available_per_prompt.append(max(1, available))
+
+        # Usamos el minimo para que TODO el batch entre en contexto.
+        return max(1, min(available_per_prompt))
 
     def _validate_with_vllm(
         self,
@@ -262,9 +306,14 @@ class QwenValidatorStage(ValidatorStage):
         assert self.vllm_client is not None
         outputs: list[dict[str, Any]] = []
         total_batches = math.ceil(len(groups) / batch_size)
-        for batch in tqdm(_chunks(groups, batch_size), total=total_batches, desc="Validator(vLLM)", leave=False):
+        for batch in tqdm(
+            _chunks(groups, batch_size),
+            total=total_batches,
+            desc="Validator(vLLM)",
+            leave=False,
+        ):
             prompts = [self._prompt(group, prompt_template) for group in batch]
-            max_tokens = max(128, self._max_new_tokens_for_batch(batch))
+            max_tokens = self._max_new_tokens_for_prompts(prompts)
             try:
                 decoded = self.vllm_client.complete_many(
                     prompts,
@@ -277,7 +326,7 @@ class QwenValidatorStage(ValidatorStage):
                 logger.warning("Qwen Validator(vLLM) fallo: %s", exc)
                 raise
             for text, group in zip(decoded, batch):
-                pair_text = f"{group.get('anchor_name','')} || {group.get('candidate',{}).get('name','')}"
+                pair_text = f"{group.get('anchor_name', '')} || {group.get('candidate', {}).get('name', '')}"
                 parsed = self._parse_auditor_json(text, pair_text)
                 override = self._hard_rule_override(group)
                 outputs.append(override or parsed)
@@ -305,10 +354,15 @@ class QwenValidatorStage(ValidatorStage):
 
         outputs: list[dict[str, Any]] = []
         total_batches = math.ceil(len(groups) / batch_size)
-        for batch in tqdm(_chunks(groups, batch_size), total=total_batches, desc="Validator", leave=False):
+        for batch in tqdm(
+            _chunks(groups, batch_size),
+            total=total_batches,
+            desc="Validator",
+            leave=False,
+        ):
             prompts = [self._prompt(group, prompt_template) for group in batch]
             encoded = self._build_batch_inputs(prompts).to(self.model.device)
-            max_tokens = self._max_new_tokens_for_batch(batch)
+            max_tokens = max(1, int(self.max_new_tokens))
 
             with torch.inference_mode():
                 generated = self.model.generate(
@@ -324,9 +378,11 @@ class QwenValidatorStage(ValidatorStage):
                 )
 
             prompt_length = encoded["input_ids"].shape[1]
-            decoded = self.tokenizer.batch_decode(generated[:, prompt_length:], skip_special_tokens=True)
+            decoded = self.tokenizer.batch_decode(
+                generated[:, prompt_length:], skip_special_tokens=True
+            )
             for text, group in zip(decoded, batch):
-                pair_text = f"{group.get('anchor_name','')} || {group.get('candidate',{}).get('name','')}"
+                pair_text = f"{group.get('anchor_name', '')} || {group.get('candidate', {}).get('name', '')}"
                 parsed = self._parse_auditor_json(text, pair_text)
                 override = self._hard_rule_override(group)
                 outputs.append(override or parsed)

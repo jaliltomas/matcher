@@ -140,4 +140,6 @@ async def run_match(request: MatchRequest) -> MatchResponse:
                 "si no, levanta Milvus en 127.0.0.1:19530."
             ),
         ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return MatchResponse.model_validate(response)

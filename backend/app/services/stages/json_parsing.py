@@ -74,15 +74,31 @@ def normalize_attributes(payload: dict[str, Any], raw_fallback: str | None = Non
     }
 
     raw_candidate = payload.get("raw")
+
+    def _extract_loose_field(raw_text: str, names: list[str]) -> str | None:
+        for name in names:
+            patterns = [
+                rf'"{name}"\s*:\s*"([^"]+)"',
+                rf"'{name}'\s*:\s*'([^']+)'",
+                rf'"{name}"\s*:\s*([^,\n\r}}]+)',
+                rf"'{name}'\s*:\s*([^,\n\r}}]+)",
+                rf"\b{name}\b\s*:\s*([^,\n\r}}]+)",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, raw_text, re.IGNORECASE)
+                if not match:
+                    continue
+                candidate = match.group(1).strip().strip('"').strip("'")
+                cleaned = _clean_scalar(candidate, 80)
+                if cleaned is not None:
+                    return cleaned
+        return None
+
     if compact["brand"] is None and isinstance(raw_candidate, str):
-        brand_match = re.search(r'"(?:brand|marca)"\s*:\s*"([^"]+)"', raw_candidate, re.IGNORECASE)
-        if brand_match:
-            compact["brand"] = _clean_scalar(brand_match.group(1), 80)
+        compact["brand"] = _extract_loose_field(raw_candidate, ["brand", "marca"])
 
     if compact["category"] is None and isinstance(raw_candidate, str):
-        category_match = re.search(r'"(?:category|categoria)"\s*:\s*"([^"]+)"', raw_candidate, re.IGNORECASE)
-        if category_match:
-            compact["category"] = _clean_scalar(category_match.group(1), 80)
+        compact["category"] = _extract_loose_field(raw_candidate, ["category", "categoria"])
 
     # Recupera cache vieja o salidas contaminadas tipo "{...}Human: ..."
     # intentando reparsear el primer JSON embebido en raw.

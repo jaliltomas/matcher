@@ -51,7 +51,7 @@ class MatchingPipeline:
             image_timeout_seconds=self.settings.image_timeout_seconds,
         )
         self.enricher = enricher or QwenNerEnricherStage(
-            model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
+            model_id=self.settings.vllm_ner_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
             max_new_tokens=self.settings.ner_max_new_tokens,
@@ -72,7 +72,7 @@ class MatchingPipeline:
             offload_between_stages=self.settings.offload_between_stages,
         )
         self.validator = validator or QwenValidatorStage(
-            model_id=self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
+            model_id=self.settings.vllm_validator_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
             device=self.settings.device,
             dtype=self.settings.dtype,
             max_new_tokens=self.settings.validator_max_new_tokens,
@@ -83,6 +83,8 @@ class MatchingPipeline:
             vllm_max_retries=self.settings.vllm_max_retries,
             vllm_disable_thinking=self.settings.vllm_disable_thinking,
             vllm_max_parallel=self.settings.vllm_max_parallel,
+            vllm_context_window=self.settings.vllm_context_window,
+            vllm_context_reserve=self.settings.vllm_context_reserve,
             offload_between_stages=self.settings.offload_between_stages,
         )
         self._cache_dir = self.settings.data_dir / "checkpoints"
@@ -304,6 +306,120 @@ class MatchingPipeline:
                 logger.warning("No se pudo persistir cache en %s: %s", stage_name, exc)
         return output, metric
 
+    def _work_unit_label(self, stage: str) -> str | None:
+        mapping = {
+            "embeddings_and_milvus": "records",
+            "vector_search": "candidates",
+            "qwen_ner": "items",
+            "xlmr_reranker": "pairs",
+            "qwen_validator": "candidates",
+        }
+        return mapping.get(stage)
+
+    def _work_units(self, stage: str, details: dict[str, Any]) -> float | None:
+        if stage == "embeddings_and_milvus":
+            anchors = int(details.get("anchors", 0))
+            products = int(details.get("products", 0))
+            return float(anchors + products)
+        if stage == "vector_search":
+            return float(int(details.get("candidates", 0)))
+        if stage == "qwen_ner":
+            return float(int(details.get("items", 0)))
+        if stage == "xlmr_reranker":
+            return float(int(details.get("pairs", 0)))
+        if stage == "qwen_validator":
+            groups = int(details.get("groups", 0))
+            fast_resolved = int(details.get("fast_resolved", 0))
+            return float(groups + fast_resolved)
+        return None
+
+    def _attach_metric_efficiency(self, metrics: list[Metric]) -> None:
+        total_stage_seconds = sum(metric.seconds for metric in metrics if metric.seconds > 0.0)
+        for metric in metrics:
+            details = metric.details
+            units = self._work_units(metric.stage, details)
+            unit_label = self._work_unit_label(metric.stage)
+            if units is not None:
+                details["work_units"] = int(units) if float(units).is_integer() else units
+            if unit_label:
+                details["work_unit_label"] = unit_label
+
+            if units and metric.seconds > 0.0:
+                details["throughput_per_sec"] = float(units / metric.seconds)
+                details["ms_per_unit"] = float((metric.seconds * 1000.0) / units)
+            else:
+                details["throughput_per_sec"] = None
+                details["ms_per_unit"] = None
+
+            if total_stage_seconds > 0.0:
+                details["time_share_pct"] = float((metric.seconds / total_stage_seconds) * 100.0)
+            else:
+                details["time_share_pct"] = None
+
+            hits = int(details.get("product_cache_hits", 0))
+            misses = int(details.get("product_cache_misses", 0))
+            total = hits + misses
+            if total > 0:
+                details["product_cache_hit_rate_pct"] = float((hits / total) * 100.0)
+
+            if metric.stage == "qwen_validator":
+                groups = int(details.get("groups", 0))
+                fast_resolved = int(details.get("fast_resolved", 0))
+                total_candidates = groups + fast_resolved
+                if total_candidates > 0:
+                    details["llm_usage_pct"] = float((groups / total_candidates) * 100.0)
+                    details["llm_avoidance_pct"] = float((fast_resolved / total_candidates) * 100.0)
+
+    def _build_efficiency_stats(
+        self,
+        metrics: list[Metric],
+        wall_seconds: float,
+        anchors_count: int,
+        products_count: int,
+        top_n: int,
+        top_k: int,
+        candidate_items_count: int,
+        unresolved_candidates: int,
+        fast_resolved: int,
+    ) -> dict[str, Any]:
+        stage_seconds = sum(metric.seconds for metric in metrics)
+        cached_stages = sum(1 for metric in metrics if bool(metric.details.get("cache_hit")))
+        dominant_stage = max(metrics, key=lambda metric: metric.seconds).stage if metrics else None
+
+        vector_candidates = anchors_count * top_n
+        shortlisted_candidates = anchors_count * top_k
+        rerank_pruning_pct = None
+        if vector_candidates > 0:
+            rerank_pruning_pct = float((1.0 - (shortlisted_candidates / vector_candidates)) * 100.0)
+
+        total_validator_candidates = unresolved_candidates + fast_resolved
+        validator_llm_usage_pct = None
+        validator_llm_avoidance_pct = None
+        if total_validator_candidates > 0:
+            validator_llm_usage_pct = float((unresolved_candidates / total_validator_candidates) * 100.0)
+            validator_llm_avoidance_pct = float((fast_resolved / total_validator_candidates) * 100.0)
+
+        return {
+            "wall_seconds": float(wall_seconds),
+            "stage_seconds": float(stage_seconds),
+            "stage_overhead_seconds": float(max(0.0, wall_seconds - stage_seconds)),
+            "stages_total": len(metrics),
+            "stages_cached": cached_stages,
+            "stage_cache_hit_rate_pct": float((cached_stages / len(metrics)) * 100.0) if metrics else 0.0,
+            "dominant_stage": dominant_stage,
+            "anchors": anchors_count,
+            "products": products_count,
+            "candidate_products_considered": candidate_items_count,
+            "vector_candidates": vector_candidates,
+            "shortlisted_candidates": shortlisted_candidates,
+            "rerank_pruning_pct": rerank_pruning_pct,
+            "validator_candidates": total_validator_candidates,
+            "validator_llm_calls": unresolved_candidates,
+            "validator_fast_resolved": fast_resolved,
+            "validator_llm_usage_pct": validator_llm_usage_pct,
+            "validator_llm_avoidance_pct": validator_llm_avoidance_pct,
+        }
+
     def _prepare_session_items(self, session_data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         anchors = [dict(item) for item in session_data["anchors"]]
         products = [dict(item) for item in session_data["products"]]
@@ -430,6 +546,7 @@ class MatchingPipeline:
         th_accept: float | None = None,
         th_reject: float | None = None,
     ) -> dict[str, Any]:
+        process_started = time.perf_counter()
         effective_batch = batch_size or self.settings.batch_size
         effective_ner_batch = ner_batch_size or max(1, effective_batch // 2)
         effective_validator_batch = validator_batch_size or max(1, effective_batch // 2)
@@ -620,7 +737,7 @@ class MatchingPipeline:
                 "top_n": top_n,
                 "prompt": extraction_prompt_id,
                 "prompt_sig": extraction_prompt_sig,
-                "model": self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
+                "model": self.settings.vllm_ner_model_id if self.settings.use_vllm else self.settings.qwen_ner_model_id,
                 "backend": "vllm" if self.settings.use_vllm else "transformers",
                 "items": len(anchors) + len(candidate_items),
                 "text_sig": hashlib.sha1(
@@ -658,6 +775,8 @@ class MatchingPipeline:
             save_fn=save_ner_cached,
         )
         metric.details["parse_fail_count"] = int(getattr(self.enricher, "parse_fail_count", 0))
+        ner_total = max(1, int(getattr(self.enricher, "total_count", len(anchors) + len(candidate_items))))
+        metric.details["parse_fail_rate_pct"] = float((metric.details["parse_fail_count"] / ner_total) * 100.0)
         metrics.append(metric)
 
         compact_attrs_by_id = {item_id: self._compact_attrs(attrs) for item_id, attrs in attributes_by_id.items()}
@@ -794,6 +913,8 @@ class MatchingPipeline:
                     }
                 )
 
+        fast_resolved_count = len(validation_lookup)
+
         validator_key = self._cache_key(
             {
                 "stage": "validator",
@@ -802,12 +923,12 @@ class MatchingPipeline:
                 "top_k": top_k,
                 "prompt": validation_prompt_id,
                 "prompt_sig": validation_prompt_sig,
-                "model": self.settings.vllm_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
+                "model": self.settings.vllm_validator_model_id if self.settings.use_vllm else self.settings.qwen_validator_model_id,
                 "backend": "vllm" if self.settings.use_vllm else "transformers",
                 "use_fast_rules": use_fast_rules,
                 "groups": len(validation_groups),
                 "unresolved_candidates": unresolved_candidates,
-                "fast_resolved": len(validation_lookup),
+                "fast_resolved": fast_resolved_count,
             }
         )
 
@@ -830,7 +951,7 @@ class MatchingPipeline:
             details={
                 "groups": len(validation_groups),
                 "unresolved_candidates": unresolved_candidates,
-                "fast_resolved": len(validation_lookup),
+                "fast_resolved": fast_resolved_count,
                 "use_fast_rules": use_fast_rules,
                 "top_k": top_k,
                 "batch_size": effective_validator_batch,
@@ -923,6 +1044,20 @@ class MatchingPipeline:
                 }
             )
 
+        self._attach_metric_efficiency(metrics)
+        wall_seconds = time.perf_counter() - process_started
+        efficiency_stats = self._build_efficiency_stats(
+            metrics=metrics,
+            wall_seconds=wall_seconds,
+            anchors_count=len(anchors),
+            products_count=len(products),
+            top_n=top_n,
+            top_k=top_k,
+            candidate_items_count=len(candidate_items),
+            unresolved_candidates=unresolved_candidates,
+            fast_resolved=fast_resolved_count,
+        )
+
         return {
             "session_id": session_id,
             "top_n": top_n,
@@ -934,4 +1069,5 @@ class MatchingPipeline:
             "thresholds": {"accept": effective_th_accept, "reject": effective_th_reject},
             "results": final_results,
             "metrics": [metric.__dict__ for metric in metrics],
+            "efficiency_stats": efficiency_stats,
         }

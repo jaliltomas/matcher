@@ -131,6 +131,25 @@ h3 {
   margin-bottom: 0.8rem;
 }
 
+.prompt-generator {
+  margin: 0.8rem 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.8rem;
+  background: #ffffff;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.prompt-meta {
+  border-top: 1px dashed var(--line);
+  padding-top: 0.5rem;
+}
+
+.prompt-meta p {
+  margin: 0.25rem 0;
+}
+
 .prompt-card {
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -148,6 +167,18 @@ h3 {
   width: 100%;
   border-collapse: collapse;
   margin-top: 0.6rem;
+}
+
+.efficiency-grid {
+  margin-top: 0.6rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.efficiency-grid p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .metrics th,

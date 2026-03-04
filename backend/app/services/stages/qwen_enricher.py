@@ -8,7 +8,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from app.services.vllm_client import VllmChatClient
-from app.services.stages.json_parsing import extract_first_json_object, normalize_attributes
+from app.services.stages.json_parsing import normalize_attributes
 from app.services.stages.base import EnricherStage
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,7 @@ class QwenNerEnricherStage(EnricherStage):
         self.strict_json = strict_json
         self.parse_fail_count = 0
         self.total_count = 0
+        self.vllm_fail_count = 0
 
         self.tokenizer: Any = None
         self.model: Any = None
@@ -163,8 +164,79 @@ class QwenNerEnricherStage(EnricherStage):
             return None
         return quote if quote in source_text else None
 
+    def _extract_best_json_object(self, text: str) -> dict[str, Any] | None:
+        candidate = (text or "").strip()
+        if "```" in candidate:
+            candidate = candidate.replace("```json", "").replace("```", "").strip()
+
+        parsed_objects: list[dict[str, Any]] = []
+        start = candidate.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escaped = False
+            found = False
+
+            for idx in range(start, len(candidate)):
+                ch = candidate[idx]
+
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                    continue
+                if ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        raw = candidate[start : idx + 1]
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, dict):
+                                parsed_objects.append(parsed)
+                        except Exception:
+                            pass
+                        found = True
+                        break
+
+            if not found:
+                break
+            start = candidate.find("{", start + 1)
+
+        if not parsed_objects:
+            return None
+
+        def score(payload: dict[str, Any]) -> int:
+            brand = payload.get("brand") if "brand" in payload else payload.get("marca")
+            category = payload.get("category") if "category" in payload else payload.get("categoria")
+            points = 0
+            if brand not in (None, "", "null", "None"):
+                points += 1
+            if category not in (None, "", "null", "None"):
+                points += 1
+            return points
+
+        best_idx = 0
+        best_score = -1
+        for idx, payload in enumerate(parsed_objects):
+            current = score(payload)
+            if current > best_score or (current == best_score and idx > best_idx):
+                best_score = current
+                best_idx = idx
+
+        return parsed_objects[best_idx]
+
     def _parse_json(self, source_text: str, output_text: str) -> dict[str, Any]:
-        parsed = extract_first_json_object(output_text)
+        parsed = self._extract_best_json_object(output_text)
         if parsed is None:
             self.parse_fail_count += 1
             logger.warning("Qwen NER parse_fail: no JSON object")
@@ -184,6 +256,19 @@ class QwenNerEnricherStage(EnricherStage):
             }
         return normalized
 
+    def _log_item_result(self, source_text: str, payload: dict[str, Any]) -> None:
+        product_name = (source_text or "").replace("\n", " ").strip()
+        if len(product_name) > 140:
+            product_name = f"{product_name[:137]}..."
+        brand = payload.get("brand") if isinstance(payload, dict) else None
+        category = payload.get("category") if isinstance(payload, dict) else None
+        logger.info(
+            "[NER] producto='%s' | brand='%s' | category='%s'",
+            product_name,
+            brand,
+            category,
+        )
+
     def _extract_with_vllm(
         self,
         items: list[dict[str, Any]],
@@ -198,8 +283,8 @@ class QwenNerEnricherStage(EnricherStage):
             try:
                 outputs = self.vllm_client.complete_many(
                     prompts,
-                    max_tokens=min(self.max_new_tokens, 256),
-                    workers=min(batch_size, 8),
+                    max_tokens=self.max_new_tokens,
+                    workers=min(batch_size, 4),
                     temperature=0.0,
                     top_p=1.0,
                 )
@@ -207,7 +292,22 @@ class QwenNerEnricherStage(EnricherStage):
                 logger.warning("Qwen NER(vLLM) fallo: %s", exc)
                 raise
             for item, output in zip(batch, outputs):
-                result[item["_id"]] = self._parse_json(item.get("nombre", ""), output)
+                source_text = item.get("nombre", "")
+                candidate_output = output
+                if not candidate_output or "{" not in candidate_output:
+                    try:
+                        candidate_output = self.vllm_client.complete(
+                            self._prompt(source_text, prompt_template),
+                            max_tokens=self.max_new_tokens,
+                            temperature=0.0,
+                            top_p=1.0,
+                            system_prompt="Responde UNICAMENTE un objeto JSON valido con keys: brand, category, evidence.",
+                        )
+                    except Exception:
+                        candidate_output = output
+                parsed = self._parse_json(source_text, candidate_output)
+                result[item["_id"]] = parsed
+                self._log_item_result(source_text, parsed)
         return result
 
     # Etapa 4 del pipeline: enriquecimiento semantico con Qwen-7B para NER.
@@ -225,8 +325,13 @@ class QwenNerEnricherStage(EnricherStage):
         if self.use_vllm:
             try:
                 return self._extract_with_vllm(items, batch_size, prompt_template)
-            except Exception:
-                self._switch_to_local_fallback()
+            except Exception as exc:
+                self.vllm_fail_count += 1
+                logger.exception("Qwen NER(vLLM) abortado; sin fallback local para evitar descarga HF: %s", exc)
+                raise RuntimeError(
+                    "NER via vLLM fallo. Se deshabilito fallback local para evitar descarga de modelos HF. "
+                    "Revisa VLLM_BASE_URL/VLLM_NER_MODEL_ID (o VLLM_MODEL_ID)/timeout y la salud del endpoint /v1/chat/completions."
+                ) from exc
 
         self._load()
         assert self.model is not None
@@ -241,7 +346,7 @@ class QwenNerEnricherStage(EnricherStage):
             with torch.inference_mode():
                 generated = self.model.generate(
                     **encoded,
-                    max_new_tokens=min(self.max_new_tokens, 256),
+                    max_new_tokens=self.max_new_tokens,
                     do_sample=False,
                     temperature=0.0,
                     top_p=1.0,
@@ -255,7 +360,10 @@ class QwenNerEnricherStage(EnricherStage):
             decoded = self.tokenizer.batch_decode(generated[:, prompt_length:], skip_special_tokens=True)
 
             for item, output in zip(batch, decoded):
-                result[item["_id"]] = self._parse_json(item.get("nombre", ""), output)
+                source_text = item.get("nombre", "")
+                parsed = self._parse_json(source_text, output)
+                result[item["_id"]] = parsed
+                self._log_item_result(source_text, parsed)
 
         self._unload()
         return result

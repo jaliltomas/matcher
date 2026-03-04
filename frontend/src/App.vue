@@ -21,6 +21,14 @@ const validationPromptId = ref("");
 const extractionPromptText = ref("");
 const validationPromptText = ref("");
 const promptPresets = ref({ extraction: [], validation: [], defaults: { extraction: "", validation: "" } });
+const promptGenVertical = ref("");
+const promptGenLanguage = ref("es");
+const promptGenBrandNotes = ref("");
+const promptGenTaxonomy = ref("");
+const promptGenEdgeCases = ref("");
+const promptGenLoading = ref(false);
+const promptGenError = ref("");
+const promptGenMeta = ref(null);
 
 const loading = ref(false);
 const errorMessage = ref("");
@@ -33,6 +41,7 @@ const canProcess = computed(() => {
   if (reuseSession.value && (uploadInfo.value?.session_id || manualSessionId.value.trim())) return true;
   return !!hasFiles.value;
 });
+const efficiencyStats = computed(() => resultData.value?.efficiency_stats || null);
 
 function onAnchorSelected(event) {
   anchorFile.value = event.target.files?.[0] || null;
@@ -45,6 +54,16 @@ function onPricesSelected(event) {
 function formatScore(value) {
   if (typeof value !== "number") return "-";
   return value.toFixed(3);
+}
+
+function formatStat(value, digits = 2) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return value.toFixed(digits);
+}
+
+function formatPercent(value, digits = 1) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return `${value.toFixed(digits)}%`;
 }
 
 function findPrompt(kind, id) {
@@ -126,6 +145,45 @@ async function processMatching() {
   }
 }
 
+function parseCsvLines(value) {
+  return String(value || "")
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function generatePromptsForClient() {
+  if (!promptGenVertical.value.trim()) {
+    promptGenError.value = "Completa la descripcion del rubro para generar prompts.";
+    return;
+  }
+
+  promptGenLoading.value = true;
+  promptGenError.value = "";
+  promptGenMeta.value = null;
+
+  try {
+    const response = await axios.post(`${apiBase}/prompts/generate`, {
+      vertical_description: promptGenVertical.value.trim(),
+      language: promptGenLanguage.value,
+      brand_notes: promptGenBrandNotes.value.trim() || null,
+      category_taxonomy: parseCsvLines(promptGenTaxonomy.value),
+      edge_cases: parseCsvLines(promptGenEdgeCases.value),
+      output_format: "json_only"
+    });
+
+    extractionPromptText.value = response.data.ner_prompt || "";
+    validationPromptText.value = response.data.validator_prompt || "";
+    promptGenMeta.value = response.data.meta || null;
+    await loadPromptPresets();
+  } catch (error) {
+    promptGenError.value =
+      error?.response?.data?.detail || error?.message || "No se pudieron generar prompts";
+  } finally {
+    promptGenLoading.value = false;
+  }
+}
+
 onMounted(loadPromptPresets);
 </script>
 
@@ -198,6 +256,76 @@ onMounted(loadPromptPresets);
         <span>Usar fast rules antes del validator LLM</span>
       </label>
 
+      <section class="prompt-generator">
+        <h3>Generador de prompts por rubro</h3>
+        <p class="attrs">
+          Describe el cliente y genera prompts de NER + Validator. Al generarlos, se cargan automaticamente en
+          "Prompt custom".
+        </p>
+        <div class="upload-grid">
+          <label class="field">
+            <span>Descripcion del rubro</span>
+            <textarea
+              v-model="promptGenVertical"
+              rows="3"
+              placeholder="Ej: farmacia, OTC, suplementos deportivos, marcas con alias..."
+            ></textarea>
+          </label>
+
+          <label class="field small">
+            <span>Idioma</span>
+            <select v-model="promptGenLanguage">
+              <option value="es">es</option>
+              <option value="en">en</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Brand notes (opcional)</span>
+            <textarea
+              v-model="promptGenBrandNotes"
+              rows="2"
+              placeholder="Patrones de marcas, alias, abreviaciones..."
+            ></textarea>
+          </label>
+
+          <label class="field">
+            <span>Taxonomia de categorias (opcional)</span>
+            <textarea
+              v-model="promptGenTaxonomy"
+              rows="2"
+              placeholder="Una por linea o separadas por coma"
+            ></textarea>
+          </label>
+
+          <label class="field">
+            <span>Edge cases (opcional)</span>
+            <textarea
+              v-model="promptGenEdgeCases"
+              rows="2"
+              placeholder="packs, sabores, bundles, variantes, etc."
+            ></textarea>
+          </label>
+        </div>
+        <button class="primary" :disabled="promptGenLoading" @click="generatePromptsForClient">
+          {{ promptGenLoading ? "Generando prompts..." : "Generar prompts" }}
+        </button>
+        <p v-if="promptGenError" class="error">{{ promptGenError }}</p>
+        <div v-if="promptGenMeta" class="prompt-meta attrs">
+          <p>
+            <strong>Thresholds sugeridos:</strong>
+            accept={{ promptGenMeta.recommended_thresholds?.accept }} |
+            reject={{ promptGenMeta.recommended_thresholds?.reject }}
+          </p>
+          <p v-if="promptGenMeta.assumptions?.length">
+            <strong>Assumptions:</strong> {{ promptGenMeta.assumptions.join(" | ") }}
+          </p>
+          <p v-if="promptGenMeta.notes?.length">
+            <strong>Notes:</strong> {{ promptGenMeta.notes.join(" | ") }}
+          </p>
+        </div>
+      </section>
+
       <div class="prompt-columns">
         <section class="prompt-card">
           <h3>Prompts de extraccion</h3>
@@ -257,22 +385,52 @@ onMounted(loadPromptPresets);
 
       <div class="metrics">
         <h3>Metricas de pipeline</h3>
+        <div v-if="efficiencyStats" class="efficiency-grid">
+          <p>
+            <strong>Wall time:</strong> {{ formatStat(efficiencyStats.wall_seconds, 2) }}s |
+            <strong>Tiempo medido en etapas:</strong> {{ formatStat(efficiencyStats.stage_seconds, 2) }}s
+          </p>
+          <p>
+            <strong>Etapas desde cache:</strong> {{ efficiencyStats.stages_cached }}/{{ efficiencyStats.stages_total }}
+            ({{ formatPercent(efficiencyStats.stage_cache_hit_rate_pct) }}) |
+            <strong>Etapa dominante:</strong> {{ efficiencyStats.dominant_stage || "-" }}
+          </p>
+          <p>
+            <strong>Poda top_n -> top_k:</strong> {{ efficiencyStats.vector_candidates }} ->
+            {{ efficiencyStats.shortlisted_candidates }} ({{ formatPercent(efficiencyStats.rerank_pruning_pct) }})
+          </p>
+          <p>
+            <strong>Validator sin LLM:</strong> {{ efficiencyStats.validator_fast_resolved }}/
+            {{ efficiencyStats.validator_candidates }} ({{ formatPercent(efficiencyStats.validator_llm_avoidance_pct) }})
+          </p>
+        </div>
         <table>
           <thead>
             <tr>
               <th>Etapa</th>
               <th>Tiempo (s)</th>
               <th>VRAM MB</th>
+              <th>Carga</th>
+              <th>ms/unidad</th>
+              <th>unid/s</th>
+              <th>% tiempo</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="metric in resultData.metrics" :key="metric.stage">
+            <tr v-for="(metric, idx) in resultData.metrics" :key="`${metric.stage}-${idx}`">
               <td>
                 {{ metric.stage }}
                 <span v-if="metric.details?.cache_hit" class="cache-hit">(cache)</span>
               </td>
               <td>{{ metric.seconds.toFixed(2) }}</td>
               <td>{{ metric.vram_mb.toFixed(1) }}</td>
+              <td>
+                {{ metric.details?.work_units ?? "-" }}
+                <span v-if="metric.details?.work_unit_label">{{ metric.details.work_unit_label }}</span>
+              </td>
+              <td>{{ formatStat(metric.details?.ms_per_unit, 2) }}</td>
+              <td>{{ formatStat(metric.details?.throughput_per_sec, 2) }}</td>
+              <td>{{ formatPercent(metric.details?.time_share_pct) }}</td>
             </tr>
           </tbody>
         </table>

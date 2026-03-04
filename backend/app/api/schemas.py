@@ -97,6 +97,7 @@ class MatchResponse(BaseModel):
     thresholds: dict[str, float] = Field(default_factory=dict)
     results: list[AnchorMatches]
     metrics: list[StageMetric]
+    efficiency_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class PromptPreset(BaseModel):

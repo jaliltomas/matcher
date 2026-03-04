@@ -41,6 +41,7 @@ class VllmChatClient:
         temperature: float = 0.0,
         top_p: float = 0.95,
         system_prompt: str = "Devuelve solo JSON valido sin texto adicional.",
+        response_format_json: bool = False,
     ) -> str:
         payload: dict = {
             "model": self.model_id,
@@ -54,6 +55,8 @@ class VllmChatClient:
         }
         if self.disable_thinking:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if response_format_json:
+            payload["response_format"] = {"type": "json_object"}
 
         last_error = None
         for attempt in range(1, self.max_retries + 2):
@@ -89,6 +92,7 @@ class VllmChatClient:
         temperature: float = 0.0,
         top_p: float = 0.95,
         system_prompt: str = "Devuelve solo JSON valido sin texto adicional.",
+        response_format_json: bool = False,
     ) -> list[str]:
         if not prompts:
             return []
@@ -102,6 +106,7 @@ class VllmChatClient:
                         temperature=temperature,
                         top_p=top_p,
                         system_prompt=system_prompt,
+                        response_format_json=response_format_json,
                     ),
                     prompts,
                 )
