@@ -108,7 +108,9 @@ VALIDATION_PRESETS = [
             '{"decision":"ACCEPT|REJECT|REVIEW","reason_code":"SAME_PRODUCT|BRAND_MISMATCH|CATEGORY_MISMATCH|INSUFFICIENT_EVIDENCE|TOO_GENERIC|AMBIGUOUS","confidence":0.0,"evidence":[]}. '
             "Reglas duras: brand mismatch => REJECT >=0.9; category mismatch claro => REJECT; "
             "si no puedes citar evidencia textual exacta para aceptar => REVIEW; no inventar brand/category faltantes; "
-            "evidence max 3 substrings exactos. Pair: {PAIR_JSON}"
+            "evidence max 2 substrings exactos. "
+            "No incluyas cadena de pensamiento ni explicaciones; solo el JSON final. "
+            "Pair: {PAIR_JSON}"
         ),
     }
 ]

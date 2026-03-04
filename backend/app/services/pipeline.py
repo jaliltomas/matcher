@@ -886,12 +886,23 @@ class MatchingPipeline:
                             "decision": "aceptado",
                         }
                 if fast is None and float(row["reranker_score"]) <= effective_th_reject:
-                    fast = {
-                        "validation_score": 0.05,
-                        "review_flag": True,
-                        "reason": "threshold_reject_fast_rule",
-                        "decision": "rechazado",
-                    }
+                    overlap = self._token_overlap(anchor["nombre"], candidate["nombre"])
+                    similarity = float(row["similarity"])
+                    a_brand = str(prompt_anchor_attrs.get("brand") or "").strip().lower()
+                    c_brand = str(prompt_candidate_attrs.get("brand") or "").strip().lower()
+                    a_cat = str(prompt_anchor_attrs.get("category") or "").strip().lower()
+                    c_cat = str(prompt_candidate_attrs.get("category") or "").strip().lower()
+                    has_brand_conflict = bool(a_brand and c_brand and a_brand != c_brand)
+                    has_category_conflict = bool(a_cat and c_cat and a_cat != c_cat)
+                    low_text_alignment = similarity < 0.82 and overlap < 0.50
+
+                    if has_brand_conflict or has_category_conflict or low_text_alignment:
+                        fast = {
+                            "validation_score": 0.05,
+                            "review_flag": True,
+                            "reason": "threshold_reject_fast_rule",
+                            "decision": "rechazado",
+                        }
                 key = f"{anchor['_id']}|{candidate['_id']}"
                 if fast is not None:
                     validation_lookup[key] = fast
@@ -903,10 +914,10 @@ class MatchingPipeline:
                         "anchor_id": anchor["_id"],
                         "candidate_id": candidate["_id"],
                         "anchor_name": anchor["nombre"],
-                        "anchor_attrs": anchor_prompt_attrs,
+                        "anchor_attrs": {},
                         "candidate": {
                             "name": candidate.get("nombre"),
-                            "attrs": prompt_candidate_attrs,
+                            "attrs": {},
                             "url": candidate.get("url_producto"),
                             "price": candidate.get("precioFinal"),
                         },
@@ -918,7 +929,7 @@ class MatchingPipeline:
         validator_key = self._cache_key(
             {
                 "stage": "validator",
-                "version": "v6",
+                "version": "v8",
                 "top_n": top_n,
                 "top_k": top_k,
                 "prompt": validation_prompt_id,
@@ -979,6 +990,24 @@ class MatchingPipeline:
             reason_code = str(decision.get("reason_code", "AMBIGUOUS"))
             confidence = float(decision.get("confidence", 0.5))
             evidence = decision.get("evidence", [])
+
+            anchor_attrs_true = compact_attrs_by_id.get(anchor_id, {})
+            candidate_attrs_true = compact_attrs_by_id.get(candidate_id, {})
+            a_brand = str(anchor_attrs_true.get("brand") or "").strip().lower()
+            c_brand = str(candidate_attrs_true.get("brand") or "").strip().lower()
+            a_cat = str(anchor_attrs_true.get("category") or "").strip().lower()
+            c_cat = str(candidate_attrs_true.get("category") or "").strip().lower()
+
+            if reason_code == "BRAND_MISMATCH" and a_brand and c_brand and a_brand == c_brand:
+                model_decision = "REVIEW"
+                reason_code = "AMBIGUOUS"
+                confidence = min(confidence, 0.5)
+
+            if reason_code == "CATEGORY_MISMATCH" and a_cat and c_cat and a_cat == c_cat:
+                model_decision = "REVIEW"
+                reason_code = "AMBIGUOUS"
+                confidence = min(confidence, 0.5)
+
             reason = reason_code
             if isinstance(evidence, list) and evidence:
                 reason = f"{reason_code}: {' | '.join(str(item) for item in evidence[:2])}"[:120]

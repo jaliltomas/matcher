@@ -120,11 +120,9 @@ class QwenValidatorStage(ValidatorStage):
         payload = {
             "anchor": {
                 "name": group["anchor_name"],
-                "attrs": group.get("anchor_attrs", {}),
             },
             "candidate": {
                 "name": candidate.get("name"),
-                "attrs": candidate.get("attrs", {}),
                 "url": candidate.get("url"),
                 "price": candidate.get("price"),
             },
@@ -141,17 +139,24 @@ class QwenValidatorStage(ValidatorStage):
             prompt = prompt.replace(
                 "{PAIR_JSON}", json.dumps(payload, ensure_ascii=False)
             )
-            return prompt
+            return (
+                "/no_think\n"
+                f"{prompt}\n\n"
+                "Reglas de salida obligatorias: responde SOLO un objeto JSON valido, en una sola linea, "
+                "sin markdown, sin explicaciones, sin razonamiento interno y sin texto adicional. "
+                "No incluyas campos fuera de: decision, reason_code, confidence, evidence. "
+                "evidence maximo 2 strings cortos."
+            )
 
         return (
+            "/no_think\n"
             "Eres un auditor de matching de productos. Evalua SOLO un par anchor-candidate. "
             "Responde SOLO JSON valido con esquema exacto: "
             '{"decision":"ACCEPT|REJECT|REVIEW","reason_code":"SAME_PRODUCT|BRAND_MISMATCH|CATEGORY_MISMATCH|INSUFFICIENT_EVIDENCE|TOO_GENERIC|AMBIGUOUS","confidence":0.0,"evidence":[]}. '
-            "Reglas duras: (1) si ambas brands existen y difieren => REJECT con confidence >= 0.9 y reason_code BRAND_MISMATCH. "
-            "(2) Si category existe en ambos y difiere claramente => REJECT con CATEGORY_MISMATCH. "
-            "(3) Si no puedes citar evidencia textual exacta que soporte ACCEPT => usa REVIEW. "
-            "(4) evidence debe contener hasta 3 substrings exactos del texto de entrada. "
-            "(5) Nunca inventes brand/category faltantes.\n"
+            "Reglas duras: (1) Si no puedes citar evidencia textual exacta que soporte ACCEPT => usa REVIEW. "
+            "(2) evidence debe contener hasta 2 substrings exactos del texto de entrada. "
+            "(3) No adivinar ni inventar atributos faltantes. "
+            "(6) NO escribas razonamiento interno, cadena de pensamiento ni explicaciones; SOLO JSON de salida.\n"
             f"PAIR_JSON: {json.dumps(payload, ensure_ascii=False)}"
         )
 
@@ -291,7 +296,9 @@ class QwenValidatorStage(ValidatorStage):
         available_per_prompt = []
         for prompt in prompts:
             prompt_tokens = self._estimate_prompt_tokens(prompt)
-            available = self.vllm_context_window - prompt_tokens - self.vllm_context_reserve
+            available = (
+                self.vllm_context_window - prompt_tokens - self.vllm_context_reserve
+            )
             available_per_prompt.append(max(1, available))
 
         # Usamos el minimo para que TODO el batch entre en contexto.
@@ -313,14 +320,21 @@ class QwenValidatorStage(ValidatorStage):
             leave=False,
         ):
             prompts = [self._prompt(group, prompt_template) for group in batch]
-            max_tokens = self._max_new_tokens_for_prompts(prompts)
+            context_safe_tokens = self._max_new_tokens_for_prompts(prompts)
+            configured_tokens = max(1, int(self.max_new_tokens))
+            max_tokens = min(configured_tokens, context_safe_tokens)
             try:
                 decoded = self.vllm_client.complete_many(
                     prompts,
                     max_tokens=max_tokens,
-                    workers=min(batch_size, 4),
+                    workers=min(batch_size, 8),
                     temperature=0.0,
                     top_p=1.0,
+                    system_prompt=(
+                        "Devuelve solo JSON valido. "
+                        "No escribas razonamiento interno ni thinking process. "
+                        "La salida debe comenzar con '{' y terminar con '}'."
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Qwen Validator(vLLM) fallo: %s", exc)

@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AnchorItem(BaseModel):
@@ -18,6 +18,45 @@ class ProductItem(BaseModel):
     seller: str | None = None
     textoffer: str | None = None
     cantidad: int | None = None
+
+    @staticmethod
+    def _coerce_float(value: Any, allow_none: bool) -> float | None:
+        if value is None:
+            return None if allow_none else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        raw = str(value).strip()
+        if not raw:
+            return None if allow_none else 0.0
+
+        lowered = raw.lower()
+        if lowered in {"n/a", "na", "null", "none", "s/d", "-"}:
+            return None if allow_none else 0.0
+
+        normalized = raw.replace("$", "").replace(" ", "")
+        if "," in normalized and "." in normalized:
+            if normalized.rfind(",") > normalized.rfind("."):
+                normalized = normalized.replace(".", "").replace(",", ".")
+            else:
+                normalized = normalized.replace(",", "")
+        elif "," in normalized:
+            normalized = normalized.replace(",", ".")
+        try:
+            return float(normalized)
+        except Exception:
+            return None if allow_none else 0.0
+
+    @field_validator("precioFinal", mode="before")
+    @classmethod
+    def _normalize_precio_final(cls, value: Any) -> float:
+        parsed = cls._coerce_float(value, allow_none=False)
+        return float(parsed if parsed is not None else 0.0)
+
+    @field_validator("precioLista", mode="before")
+    @classmethod
+    def _normalize_precio_lista(cls, value: Any) -> float | None:
+        return cls._coerce_float(value, allow_none=True)
 
 
 class UploadResponse(BaseModel):
